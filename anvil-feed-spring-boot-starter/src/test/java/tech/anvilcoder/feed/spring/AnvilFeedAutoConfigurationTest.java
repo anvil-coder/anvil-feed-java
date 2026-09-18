@@ -3,6 +3,8 @@ package tech.anvilcoder.feed.spring;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.beans.factory.support.BeanDefinitionRegistry;
+import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.system.CapturedOutput;
@@ -157,6 +159,23 @@ class AnvilFeedAutoConfigurationTest {
         runner.withPropertyValues("anvil.feed.token=" + TOKEN, "anvil.feed.service=shop-api",
                         "anvil.feed.in-app-packages=")
                 .run(context -> assertThat(context.getBean(AnvilFeedConfig.class).inAppPackages()).isEmpty());
+    }
+
+    /**
+     * An application in the DEFAULT package: {@code AutoConfigurationPackages.get} answers {@code [""]},
+     * which is not a package prefix at all. The core's builder drops blanks, so the list ends up empty and
+     * the structural rule applies — which is the only honest answer for an application that told us
+     * nothing.
+     */
+    @Test
+    void anApplicationInTheDefaultPackageFallsBackToTheStructuralRule() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(AnvilFeedAutoConfiguration.class))
+                .withInitializer(context -> AutoConfigurationPackages.register(
+                        (BeanDefinitionRegistry) context.getBeanFactory(), ""))
+                .withPropertyValues("anvil.feed.token=" + TOKEN, "anvil.feed.service=shop-api")
+                .run(context -> assertThat(context.getBean(AnvilFeedConfig.class).inAppPackages())
+                        .isEmpty());
     }
 
     @Test

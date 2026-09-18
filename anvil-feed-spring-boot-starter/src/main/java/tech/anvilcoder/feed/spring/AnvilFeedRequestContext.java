@@ -72,17 +72,35 @@ final class AnvilFeedRequestContext {
         return url.toString();
     }
 
-    /** The route PATTERN Spring matched, or null when nothing was matched (a 404, a filter failure). */
+    /**
+     * The route PATTERN Spring matched, or null when nothing was matched (a 404, a filter failure).
+     *
+     * <p>ONE branch, deliberately. The earlier shape had a blank guard and then a fallback line that
+     * returned the same blank value anyway, so an empty pattern travelled as {@code tags: {"route": ""}}.
+     * FR-6 (c) refuses placeholder values in a field that could not be determined, and an empty tag is
+     * the same species: it is a filter an operator can select and never a fact.
+     */
     private static String route(HttpServletRequest request) {
         Object pattern = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
-        if (pattern instanceof String text && !text.isBlank()) {
-            return text;
+        if (pattern == null) {
+            return null;
         }
-        return pattern == null ? null : String.valueOf(pattern);
+        String text = String.valueOf(pattern);
+        return text.isBlank() ? null : text;
     }
 
-    /** The status this fault is KNOWN to produce, or null. See the class comment, point 2. */
-    private static Integer statusOf(Throwable error, HttpServletResponse response) {
+    /**
+     * The status the EXCEPTION ITSELF declares, or null — and nothing else.
+     *
+     * <p>This is the gate {@link AnvilFeedExceptionResolver} decides on, so it may not fall back to the
+     * response: at the moment an exception reaches a resolver the response is still 200, and a rule that
+     * read it there would classify every fault as a server failure. Spring's whole
+     * {@code DefaultHandlerExceptionResolver} family implements {@link ErrorResponse}
+     * ({@code NoResourceFoundException}, {@code MissingServletRequestParameterException},
+     * {@code HttpRequestMethodNotSupportedException}, {@code HttpMessageNotReadableException}, …), so one
+     * question answers for all of them.
+     */
+    static Integer declaredStatusOf(Throwable error) {
         if (error instanceof ErrorResponse carried) {
             return carried.getStatusCode().value();
         }
@@ -92,6 +110,15 @@ final class AnvilFeedRequestContext {
             if (annotated != null) {
                 return annotated.code().value();
             }
+        }
+        return null;
+    }
+
+    /** The status this fault is KNOWN to produce, or null. See the class comment, point 2. */
+    private static Integer statusOf(Throwable error, HttpServletResponse response) {
+        Integer declared = declaredStatusOf(error);
+        if (declared != null) {
+            return declared;
         }
         int written = response == null ? 0 : response.getStatus();
         return written >= 400 ? written : null;

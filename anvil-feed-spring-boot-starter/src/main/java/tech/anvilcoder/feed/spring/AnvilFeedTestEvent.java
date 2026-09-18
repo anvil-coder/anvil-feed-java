@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.ExitCodeGenerator;
 
 import tech.anvilcoder.feed.AnvilFeedClient;
 import tech.anvilcoder.feed.AnvilFeedConfig;
@@ -31,9 +32,27 @@ import java.util.function.Consumer;
  *   rejected             it arrived and was refused, with the ingest's own reason_code
  *   failed transiently   it did not arrive; the event stays in the queue and the log says why
  *   disabled             nothing was sent, because the SDK is switched off — a missing token, usually
+ *   nothing was queued   a 401 earlier in this process stopped the SDK for its lifetime
  * </pre>
+ *
+ * <h2>The exit code</h2>
+ * {@code accepted} is 0 and every other verdict is 1, which is the Laravel twin's contract
+ * ({@code TestCommand::handle(): int}, {@code self::SUCCESS} / {@code self::FAILURE}) — a smoke-test stage
+ * that runs this and passes on a {@code no_binding} rejection is the "it was sent" proxy this class exists
+ * to kill, reintroduced one layer up.
+ *
+ * <p><b>Spring Boot only uses an {@link ExitCodeGenerator} where the application actually exits.</b> In a
+ * long-running web application the runner prints its verdict and the server keeps serving; the code is
+ * used when the process ends through {@code SpringApplication.exit(...)}, which is what a smoke-test
+ * launcher does:
+ *
+ * <pre>{@code
+ * public static void main(String[] args) {
+ *     System.exit(SpringApplication.exit(SpringApplication.run(ShopApplication.class, args)));
+ * }
+ * }</pre>
  */
-public final class AnvilFeedTestEvent implements CommandLineRunner {
+public final class AnvilFeedTestEvent implements CommandLineRunner, ExitCodeGenerator {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -58,11 +77,21 @@ public final class AnvilFeedTestEvent implements CommandLineRunner {
         this.out = out;
     }
 
+    private volatile int exitCode;
+
     @Override
     public void run(String... args) {
-        for (String line : report()) {
+        List<String> lines = report();
+        for (String line : lines) {
             out.accept(line);
         }
+        exitCode = lines.contains("verdict:     accepted") ? 0 : 1;
+    }
+
+    /** 0 for {@code accepted}, 1 for every other verdict — and 0 before {@link #run} has said anything. */
+    @Override
+    public int getExitCode() {
+        return exitCode;
     }
 
     /** Every line this would print, in order. Separated from printing so a test can read the verdict. */

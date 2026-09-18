@@ -21,3 +21,13 @@ tasks.withType<JavaCompile>().configureEach {
     // RequestScope javadoc warns this module about — is still on and still fatal.
     options.compilerArgs.add("-Xlint:-processing")
 }
+
+tasks.test {
+    // The contract file lives above the Gradle root. AnvilFeedEnvironmentTest reads the `env` block out
+    // of it rather than restating the five variable names, exactly as the core's ConfigParityTest does —
+    // a name that moves in the file has to move here too, or a test goes red.
+    systemProperty(
+        "anvilfeed.conformance",
+        rootProject.projectDir.parentFile.resolve("conformance").absolutePath,
+    )
+}

@@ -14,9 +14,12 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.task.SimpleAsyncTaskSchedulerCustomizer;
 import org.springframework.boot.task.ThreadPoolTaskSchedulerCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.core.task.TaskDecorator;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
@@ -203,13 +206,33 @@ public class AnvilFeedAutoConfiguration {
 
     /**
      * {@code @Scheduled} is the one place Spring exposes an {@code ErrorHandler} rather than a decorator,
-     * and a customizer is the only way to reach the scheduler Spring Boot builds. It is applied to the
-     * builder, so an application that sets its own error handler after this still wins.
+     * and a customizer is the only way to reach the scheduler Spring Boot builds — never the thread name,
+     * which an application is free to change and most do.
+     *
+     * <p><b>No {@code @ConditionalOnMissingBean} on the customizer type.</b> A customizer is an ADDITIVE
+     * extension point: {@code ThreadPoolTaskSchedulerBuilder} applies every customizer bean, in order.
+     * Conditioning on the type meant that any application with a customizer of its own — one line,
+     * {@code s -> s.setThreadNamePrefix("app-")}, which most production applications have — silently lost
+     * {@code @Scheduled} capture, with no log line and green tests. That is the wrong shape for this
+     * contract; it is the right shape for {@code TaskDecorator} above, which Boot resolves with
+     * {@code getIfUnique()}.
+     *
+     * <p>{@link Ordered#HIGHEST_PRECEDENCE} so that an application which sets its OWN error handler in its
+     * own customizer still wins: the last write to the builder is the one that counts.
      */
     @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
     @ConditionalOnClass(ThreadPoolTaskSchedulerCustomizer.class)
-    @ConditionalOnMissingBean(ThreadPoolTaskSchedulerCustomizer.class)
     public ThreadPoolTaskSchedulerCustomizer anvilFeedTaskSchedulerCustomizer(AnvilFeedClient client) {
+        return scheduler -> scheduler.setErrorHandler(new AnvilFeedErrorHandler(client));
+    }
+
+    /** The same, for the scheduler Boot builds when {@code spring.threads.virtual.enabled=true}. */
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    @ConditionalOnClass(SimpleAsyncTaskSchedulerCustomizer.class)
+    public SimpleAsyncTaskSchedulerCustomizer anvilFeedVirtualThreadSchedulerCustomizer(
+            AnvilFeedClient client) {
         return scheduler -> scheduler.setErrorHandler(new AnvilFeedErrorHandler(client));
     }
 
@@ -230,16 +253,25 @@ public class AnvilFeedAutoConfiguration {
     @ConditionalOnClass({Filter.class, HandlerExceptionResolver.class})
     public static class ServletCapture {
 
+        /** {@code ignored_request_paths}, asked of the raw URI AND of the path within the application. */
         @Bean
         @ConditionalOnMissingBean
-        public AnvilFeedExceptionResolver anvilFeedExceptionResolver(AnvilFeedClient client) {
-            return new AnvilFeedExceptionResolver(client);
+        public AnvilFeedIgnoredPaths anvilFeedIgnoredPaths(AnvilFeedConfig config) {
+            return new AnvilFeedIgnoredPaths(config);
         }
 
         @Bean
         @ConditionalOnMissingBean
-        public AnvilFeedRequestFilter anvilFeedRequestFilter(AnvilFeedClient client) {
-            return new AnvilFeedRequestFilter(client);
+        public AnvilFeedExceptionResolver anvilFeedExceptionResolver(AnvilFeedClient client,
+                                                                     AnvilFeedIgnoredPaths ignoredPaths) {
+            return new AnvilFeedExceptionResolver(client, ignoredPaths);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean
+        public AnvilFeedRequestFilter anvilFeedRequestFilter(AnvilFeedClient client,
+                                                             AnvilFeedIgnoredPaths ignoredPaths) {
+            return new AnvilFeedRequestFilter(client, ignoredPaths);
         }
     }
 

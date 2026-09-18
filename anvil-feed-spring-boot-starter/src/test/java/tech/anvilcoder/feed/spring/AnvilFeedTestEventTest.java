@@ -23,14 +23,17 @@ class AnvilFeedTestEventTest {
 
     private static final String TOKEN = AnvilFeedTestSupport.TOKEN;
 
-    private record Run(List<String> lines, AnvilFeedClient client) {
+    private record Run(List<String> lines, AnvilFeedClient client, int exitCode) {
     }
 
     private static Run run(AnvilFeedConfig config, Transport ingest) {
         AnvilFeedVerdict verdict = new AnvilFeedVerdict();
         AnvilFeedClient client = AnvilFeedClient.create(config, verdict.recording(ingest),
                 FeedLogger.toSystemLogger(), GitContext.none());
-        return new Run(new AnvilFeedTestEvent(config, client, verdict, line -> { }).report(), client);
+        List<String> printed = new java.util.ArrayList<>();
+        AnvilFeedTestEvent runner = new AnvilFeedTestEvent(config, client, verdict, printed::add);
+        runner.run();
+        return new Run(printed, client, runner.getExitCode());
     }
 
     private static AnvilFeedConfig config() {
@@ -84,6 +87,23 @@ class AnvilFeedTestEventTest {
         assertThat(run.lines()).contains("verdict:     disabled");
         assertThat(run.lines()).anyMatch(line -> line.contains("ANVIL_INGEST_TOKEN"));
         assertThat(run.lines()).noneMatch(line -> line.startsWith("event_id:"));
+    }
+
+    /**
+     * FR-8 through a smoke-test stage: a stage that passes on a {@code no_binding} rejection is the "it
+     * was sent" proxy this class exists to kill, reintroduced one layer up. The twin is a command with
+     * {@code self::SUCCESS} / {@code self::FAILURE}; this is the same contract.
+     */
+    @Test
+    void theExitCodeIsZeroOnlyForAccepted() {
+        assertThat(run(config(), new StubIngest()).exitCode()).isEqualTo(0);
+        assertThat(run(config(), StubIngest.rejecting("no_binding", "nothing bound")).exitCode())
+                .isEqualTo(1);
+        assertThat(run(config(), new StubIngest(IngestResponse.of(503, "", 30))).exitCode()).isEqualTo(1);
+
+        AnvilFeedConfig disabled = AnvilFeedConfig.builder().service("shop-api")
+                .build(FeedLogger.toSystemLogger());
+        assertThat(run(disabled, new StubIngest()).exitCode()).isEqualTo(1);
     }
 
     /** The token is printed because a wrong one is the commonest fault — and only twelve characters of it. */

@@ -58,7 +58,13 @@ public class AnvilFeedProperties {
     private Integer fingerprintWindowMs;
     /**
      * Exceptions raised while serving one of these are the ingest's own failure and are not reported.
-     * The default is {@code ["/api/feed/**"]} and it matters here: the host may BE the ingest.
+     * The default is <code>["/api/feed/**"]</code> and it matters here: the host may BE the ingest.
+     *
+     * <p>Write the pattern WITHOUT the context path. A servlet request's URI includes
+     * {@code server.servlet.context-path}, so an ingest deployed under {@code /shop} really serves
+     * {@code /shop/api/feed/events} — the starter therefore applies every pattern twice, once to the raw
+     * URI and once to the path within the application, and either match counts. A pattern written with
+     * the context path still works; one written without it now works too, which is what everybody writes.
      */
     private List<String> ignoredRequestPaths;
     /**

@@ -15,7 +15,8 @@ import tech.anvilcoder.feed.AnvilFeedClient;
 import java.io.IOException;
 
 /**
- * Tells the SDK what this thread is serving, and catches what the dispatcher servlet could not.
+ * Tells the SDK what this thread is serving, catches what the dispatcher servlet could not, and reaches
+ * the verdict on what {@link AnvilFeedExceptionResolver} parked.
  *
  * <p><b>The scope (FR-2 d b).</b> {@link AnvilFeedClient#enterRequest(String)} is the only way the core
  * learns the path, and the loop guard needs it: an exception raised while serving {@code /api/feed/**} is
@@ -26,21 +27,31 @@ import java.io.IOException;
  *
  * <p>It is registered at {@link Ordered#HIGHEST_PRECEDENCE} so that the scope is open for every other
  * filter too, and it is a {@code REQUEST}-dispatch filter (Spring Boot's default for a {@code Filter}
- * bean), so a container's ERROR re-dispatch does not open a second scope around the error page.
+ * bean), so a container's ERROR re-dispatch to {@code /error} does not open a second scope around the
+ * error page. One consequence is worth knowing: on an {@code ASYNC} dispatch the resolver runs on a
+ * thread that has no open scope. Nothing is lost, because a capture whose own context carries a
+ * {@code request.url} has the loop guard applied to THAT — but application code calling
+ * {@code AnvilFeedClient.captureException} directly on such a thread has no scope to consult.
+ *
+ * <p><b>The verdict.</b> The resolver cannot know whether an application {@code @ExceptionHandler} is
+ * about to turn the fault into a deliberate answer; this layer can, and the test is not a heuristic: a
+ * dispatch that RESOLVED the exception returns normally, and a dispatch that did not rethrows it. So a
+ * parked {@link AnvilFeedCandidate} becomes an event exactly when the chain throws, and is dropped
+ * without a line when the chain returns.
  *
  * <p><b>The catch.</b> An exception thrown by another filter — a security filter, a rate limiter, a
- * request-logging decorator — never reaches {@link AnvilFeedExceptionResolver}, because it never reaches
- * the dispatcher servlet. Those are exactly the faults nobody sees. The throwable is captured and then
- * <b>rethrown unchanged</b>: this filter observes, it does not handle. {@link AnvilFeedReported} keeps the
- * ordinary case — where the resolver already made the event and the dispatcher rethrew the same throwable
- * through here — at exactly one event (FR-1 a).
+ * request-logging decorator — never reaches the resolver, because it never reaches the dispatcher servlet.
+ * Those are exactly the faults nobody sees, and they are unhandled by construction. The throwable is
+ * captured and then <b>rethrown unchanged</b>: this filter observes, it does not handle.
  */
 public final class AnvilFeedRequestFilter implements Filter, Ordered {
 
     private final AnvilFeedClient client;
+    private final AnvilFeedIgnoredPaths ignoredPaths;
 
-    public AnvilFeedRequestFilter(AnvilFeedClient client) {
+    public AnvilFeedRequestFilter(AnvilFeedClient client, AnvilFeedIgnoredPaths ignoredPaths) {
         this.client = client;
+        this.ignoredPaths = ignoredPaths;
     }
 
     @Override
@@ -71,8 +82,27 @@ public final class AnvilFeedRequestFilter implements Filter, Ordered {
 
     private void capture(Throwable error, HttpServletRequest request, ServletResponse response) {
         try {
+            if (ignoredPaths.ignores(request)) {
+                return;
+            }
+
+            AnvilFeedCandidate parked = AnvilFeedCandidate.on(request);
+            if (parked != null) {
+                // The resolver saw the fault as it was raised, with its request context. What reached
+                // here is the ServletException the servlet layer rewrapped it in, and an event about the
+                // wrapper names the wrong type and carries the wrong frames.
+                if (parked.claim() && AnvilFeedReported.firstTime(parked.error())) {
+                    client.captureException(parked.error(), parked.context());
+                }
+                return;
+            }
+
+            Integer declared = AnvilFeedRequestContext.declaredStatusOf(error);
+            if (declared != null && declared < 500) {
+                return;   // the same client-error rule the resolver applies
+            }
             if (!AnvilFeedReported.firstTime(error)) {
-                return;   // the resolver already made the event, and the dispatcher rethrew it through here
+                return;
             }
             HttpServletResponse http = response instanceof HttpServletResponse typed ? typed : null;
             client.captureException(error, AnvilFeedRequestContext.of(request, http, error));

@@ -3,9 +3,12 @@ package tech.anvilcoder.feed.spring;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.task.SimpleAsyncTaskSchedulerCustomizer;
 import org.springframework.boot.task.ThreadPoolTaskSchedulerCustomizer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.scheduling.annotation.AsyncConfigurer;
+import org.springframework.scheduling.concurrent.SimpleAsyncTaskScheduler;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.util.ErrorHandler;
 
 import shop.CheckoutService;
@@ -97,23 +100,104 @@ class AnvilFeedBackgroundCaptureTest {
 
     /** The handler alone would be a bean nothing consults: Spring reads it off an AsyncConfigurer. */
     @Test
-    void theStarterRegistersTheAsyncAndSchedulerHooks() {
-        new ApplicationContextRunner()
+    void theStarterRegistersTheAsyncHook() {
+        runner().run(context -> {
+            assertThat(context).hasSingleBean(AsyncConfigurer.class);
+            assertThat(context.getBean(AsyncConfigurer.class).getAsyncUncaughtExceptionHandler())
+                    .isInstanceOf(AnvilFeedAsyncExceptionHandler.class);
+            assertThat(context.getBean(AsyncConfigurer.class).getAsyncExecutor())
+                    .describedAs("null keeps Spring's own executor; taking it would be a trade nobody "
+                            + "agreed to")
+                    .isNull();
+        });
+    }
+
+    /**
+     * A scheduler customizer is an ADDITIVE extension point — Spring Boot's builder applies every one of
+     * them. Counting beans is the proxy that hid the defect this test exists for: with
+     * {@code @ConditionalOnMissingBean(ThreadPoolTaskSchedulerCustomizer.class)}, any application with a
+     * customizer of its own (one line, {@code s -> s.setThreadNamePrefix("app-")}, which most production
+     * applications have) silently lost {@code @Scheduled} capture. So this applies what the context really
+     * has to a real scheduler and reads the error handler back off it.
+     */
+    @Test
+    void theSchedulerHookSurvivesAnApplicationsOwnCustomizer() {
+        ThreadPoolTaskSchedulerCustomizer theirs = scheduler -> scheduler.setThreadNamePrefix("app-");
+
+        runner().withBean("theirs", ThreadPoolTaskSchedulerCustomizer.class, () -> theirs).run(context -> {
+            RecordingScheduler scheduler = new RecordingScheduler();
+            context.getBeanProvider(ThreadPoolTaskSchedulerCustomizer.class)
+                    .orderedStream().forEach(customizer -> customizer.customize(scheduler));
+
+            assertThat(scheduler.handler)
+                    .describedAs("the nightly job that fails every night must still reach an inbox")
+                    .isInstanceOf(AnvilFeedErrorHandler.class);
+            assertThat(scheduler.getThreadNamePrefix()).isEqualTo("app-");
+        });
+    }
+
+    /** The same, for the scheduler Boot builds when virtual threads are on. */
+    @Test
+    void theVirtualThreadSchedulerIsCoveredToo() {
+        runner().run(context -> {
+            RecordingVirtualScheduler scheduler = new RecordingVirtualScheduler();
+            context.getBeanProvider(SimpleAsyncTaskSchedulerCustomizer.class)
+                    .orderedStream().forEach(customizer -> customizer.customize(scheduler));
+
+            assertThat(scheduler.handler).isInstanceOf(AnvilFeedErrorHandler.class);
+        });
+    }
+
+    /**
+     * Ours is ordered first, so an application that sets its OWN error handler still wins: the last write
+     * to the scheduler is the one that counts.
+     */
+    @Test
+    void anApplicationsOwnErrorHandlerStillWins() {
+        ErrorHandler theirs = error -> { };
+        ThreadPoolTaskSchedulerCustomizer theirCustomizer = scheduler -> scheduler.setErrorHandler(theirs);
+
+        runner().withBean("theirs", ThreadPoolTaskSchedulerCustomizer.class, () -> theirCustomizer)
+                .run(context -> {
+                    RecordingScheduler scheduler = new RecordingScheduler();
+                    context.getBeanProvider(ThreadPoolTaskSchedulerCustomizer.class)
+                            .orderedStream().forEach(customizer -> customizer.customize(scheduler));
+
+                    assertThat(scheduler.handler).isSameAs(theirs);
+                });
+    }
+
+    private ApplicationContextRunner runner() {
+        return new ApplicationContextRunner()
                 .withConfiguration(AutoConfigurations.of(AnvilFeedAutoConfiguration.class))
                 .withBean(Transport.class, () -> new StubIngest())
                 .withPropertyValues("anvil.feed.token=" + AnvilFeedTestSupport.TOKEN,
-                        "anvil.feed.service=shop-api")
-                .run(context -> {
-                    assertThat(context).hasSingleBean(AsyncConfigurer.class);
-                    assertThat(context).hasSingleBean(ThreadPoolTaskSchedulerCustomizer.class);
-                    assertThat(context.getBean(AsyncConfigurer.class)
-                            .getAsyncUncaughtExceptionHandler())
-                            .isInstanceOf(AnvilFeedAsyncExceptionHandler.class);
-                    assertThat(context.getBean(AsyncConfigurer.class).getAsyncExecutor())
-                            .describedAs("null keeps Spring's own executor; taking it would be a trade "
-                                    + "nobody agreed to")
-                            .isNull();
-                });
+                        "anvil.feed.service=shop-api");
+    }
+
+    /** {@code ThreadPoolTaskScheduler} has a setter for the error handler and no getter. */
+    static final class RecordingScheduler extends ThreadPoolTaskScheduler {
+
+        private static final long serialVersionUID = 1L;
+
+        private transient ErrorHandler handler;
+
+        @Override
+        public void setErrorHandler(ErrorHandler errorHandler) {
+            this.handler = errorHandler;
+        }
+    }
+
+    static final class RecordingVirtualScheduler extends SimpleAsyncTaskScheduler {
+
+        private static final long serialVersionUID = 1L;
+
+        private transient ErrorHandler handler;
+
+        @Override
+        public void setErrorHandler(ErrorHandler errorHandler) {
+            this.handler = errorHandler;
+        }
     }
 
     /** An application that has configured its own AsyncConfigurer keeps it, handler included. */

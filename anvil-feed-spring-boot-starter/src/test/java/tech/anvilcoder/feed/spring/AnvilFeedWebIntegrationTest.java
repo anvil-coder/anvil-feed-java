@@ -104,6 +104,54 @@ class AnvilFeedWebIntegrationTest {
         assertEquals(0, client.queue().size());
     }
 
+    // ------------------------------------------------------------- the gate, end to end
+
+    /** Class 1: the application's own {@code @RestControllerAdvice} answered it. A deliberate 402. */
+    @Test
+    void anExceptionAnApplicationHandlerAnsweredIsNotAnIncident() throws Exception {
+        mockMvc.perform(get("/pay")).andExpect(result ->
+                assertEquals(402, result.getResponse().getStatus()));
+
+        assertEquals(0, client.queue().size(), "a handled exception is a deliberate answer, not a fault");
+    }
+
+    /** Class 2: the exception declares a 404. */
+    @Test
+    void aDeclaredClientErrorIsNotAnIncident() throws Exception {
+        mockMvc.perform(get("/missing")).andExpect(result ->
+                assertEquals(404, result.getResponse().getStatus()));
+
+        assertEquals(0, client.queue().size());
+    }
+
+    /** Class 2 again, through Spring's own ErrorResponse family: a missing required parameter. */
+    @Test
+    void springsOwnBadRequestIsNotAnIncident() throws Exception {
+        mockMvc.perform(get("/search")).andExpect(result ->
+                assertEquals(400, result.getResponse().getStatus()));
+
+        assertEquals(0, client.queue().size());
+    }
+
+    /** And a wrong method — the 405 a scanner produces by the hundred. */
+    @Test
+    void springsOwnMethodNotAllowedIsNotAnIncident() throws Exception {
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/orders"))
+                .andExpect(result -> assertEquals(405, result.getResponse().getStatus()));
+
+        assertEquals(0, client.queue().size());
+    }
+
+    /** Class 3: the exception declares a 502. A server failure, and an incident. */
+    @Test
+    void aDeclaredServerFailureIsAnIncident() throws Exception {
+        mockMvc.perform(get("/upstream")).andExpect(result ->
+                assertEquals(502, result.getResponse().getStatus()));
+
+        assertEquals(1, client.queue().size());
+        assertEquals(502, map(client.queue().take(1).get(0).payload().get("request")).get("status_code"));
+    }
+
     @Test
     void aRequestThatWorksIsUntouched() throws Exception {
         mockMvc.perform(get("/orders")).andExpect(result ->

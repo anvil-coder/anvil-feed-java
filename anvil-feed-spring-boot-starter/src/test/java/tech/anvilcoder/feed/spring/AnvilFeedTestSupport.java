@@ -31,6 +31,15 @@ final class AnvilFeedTestSupport {
         return client(new StubIngest());
     }
 
+    /** The two servlet capture points, wired the way the auto-configuration wires them. */
+    static AnvilFeedExceptionResolver resolver(AnvilFeedClient client) {
+        return new AnvilFeedExceptionResolver(client, new AnvilFeedIgnoredPaths(client.config()));
+    }
+
+    static AnvilFeedRequestFilter filter(AnvilFeedClient client) {
+        return new AnvilFeedRequestFilter(client, new AnvilFeedIgnoredPaths(client.config()));
+    }
+
     /** The one queued event's payload. */
     static Map<String, Object> onlyEvent(AnvilFeedClient client) {
         List<tech.anvilcoder.feed.FeedEvent> taken = client.queue().take(2);
