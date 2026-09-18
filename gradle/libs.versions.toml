@@ -1,0 +1,22 @@
+# C18: the ONE place a version number lives. Task 11's CI grep fails the build if any of these
+# numbers is spelled a second time anywhere under java/.
+[versions]
+java = "25"
+springBoot = "4.0.0"
+jackson = "2.18.2"
+junit = "5.11.4"
+slf4j = "2.0.16"
+assertj = "3.26.3"
+jsonSchemaValidator = "1.5.4"
+
+[libraries]
+jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version = "1.11.4" }
+assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+json-schema-validator = { module = "com.networknt:json-schema-validator", version.ref = "jsonSchemaValidator" }
+spring-boot-starter-web = { module = "org.springframework.boot:spring-boot-starter-web", version.ref = "springBoot" }
+spring-boot-starter-test = { module = "org.springframework.boot:spring-boot-starter-test", version.ref = "springBoot" }
+spring-boot-autoconfigure = { module = "org.springframework.boot:spring-boot-autoconfigure", version.ref = "springBoot" }
+spring-boot-configuration-processor = { module = "org.springframework.boot:spring-boot-configuration-processor", version.ref = "springBoot" }
