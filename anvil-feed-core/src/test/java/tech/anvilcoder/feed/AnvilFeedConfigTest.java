@@ -32,6 +32,12 @@ class AnvilFeedConfigTest {
      * default that drifts in one language fails here rather than in a customer's cockpit (review
      * finding 8). The file is read from the repository root through the property the build wires up —
      * there is no copy under {@code java/}.
+     *
+     * <p>This overlaps {@link ConfigParityTest#everyDefaultMatchesTheSharedList()}, which came later and
+     * holds the same claim in BOTH directions. The overlap is left standing rather than resolved here:
+     * this test also pins that {@code release} has no default and that the three usable values are enough
+     * to switch the SDK on, and deleting a reviewed test to remove a duplication is a decision for
+     * whoever consolidates the two, not a side effect of adding a block to the file.
      */
     @Test
     void everyDefaultIsTheOneBothLanguagesAgreeOn() throws Exception {
@@ -39,7 +45,10 @@ class AnvilFeedConfigTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> expected =
                 new ObjectMapper().readValue(Files.readString(fixture), LinkedHashMap.class);
-        expected.remove("note");
+        // The keys of that file that are not parameters. The list is ConfigParityTest's, deliberately:
+        // this test and that one read the same file and must agree about what counts as a parameter, and
+        // a second copy of the list here is a second place to forget when the file grows a block.
+        ConfigParityTest.NOT_A_PARAMETER.forEach(expected::remove);
 
         AnvilFeedConfig config = usable().build(logger);
         Map<String, Object> actual = new LinkedHashMap<>();

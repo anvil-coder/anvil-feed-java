@@ -192,8 +192,12 @@ class ConfigParityTest {
      * #theLanguageSpecificBlockAgreesWithThisSdksExemptions()}. That pairing is the rule this list carries:
      * a name added here without a test added with it turns a contract file into a file with prose in it,
      * and prose in a contract is what goes quietly wrong while every guard stays green.
+     *
+     * <p>Package-private rather than private because {@link AnvilFeedConfigTest} reads the same file and
+     * needs the same answer. It had its own {@code remove("note")} and went red when the blocks were
+     * added — a third list of reserved names would have been a third place to forget.
      */
-    private static final List<String> NOT_A_PARAMETER = List.of("note", "env", "language_specific");
+    static final List<String> NOT_A_PARAMETER = List.of("note", "env", "language_specific");
 
     private static List<String> sharedListKeys() throws Exception {
         JsonNode file = JSON.readTree(Files.readString(CONFORMANCE.resolve("config-defaults.json")));
