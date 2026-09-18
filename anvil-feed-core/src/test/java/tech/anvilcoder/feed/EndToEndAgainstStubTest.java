@@ -726,6 +726,31 @@ class EndToEndAgainstStubTest {
         assertThat(body.path("rejected").path(0).path("message").asText()).contains("canonical UUID");
     }
 
+    /**
+     * Review finding 7. {@code AnvilFeedEventMapper.majorIsSupported} parses the major with
+     * {@code Integer.parseInt}, which THROWS on trailing garbage, so {@code "1abc"} is
+     * {@code unsupported_schema_version} at the running ingest. The stub read it with
+     * {@code Number.parseInt}, which reads the {@code 1} and stops, and answered 202 — the one branch on
+     * which this replay was looser than the server it replays. No SDK sends anything but {@code "1.0"},
+     * so nothing shipped depended on it; "rule for rule" is the stub's own claim about itself, and a
+     * claim nothing checks is the proxy this whole task exists to make expensive.
+     */
+    @Test
+    void aSchemaVersionWithATrailingGarbageMajorIsRefusedLikeTheMapperRefusesIt() throws Exception {
+        com.fasterxml.jackson.databind.node.ObjectNode event =
+                (com.fasterxml.jackson.databind.node.ObjectNode)
+                        JSON.readTree(Files.readString(CONFORMANCE.resolve("valid/minimal.json")));
+        event.put("schema_version", "1abc");
+
+        HttpResponse<String> answer = post("/raw/accepted/api/feed/events", JSON.writeValueAsString(event));
+        JsonNode body = JSON.readTree(answer.body());
+
+        assertThat(answer.statusCode()).isEqualTo(202);
+        assertThat(body.path("accepted")).isEmpty();
+        assertThat(body.path("rejected").path(0).path("reason_code").asText())
+                .isEqualTo("unsupported_schema_version");
+    }
+
     /** Disabled is the fourth verdict, and it reaches no socket at all. */
     @Test
     void aDisabledSdkSendsNothing() throws Exception {

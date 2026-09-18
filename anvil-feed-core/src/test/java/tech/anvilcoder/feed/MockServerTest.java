@@ -222,6 +222,15 @@ class MockServerTest {
                                 entry.scenario())
                         .isEqualTo(NOW + entry.retryAfter() * 1000L);
             }
+            case "backoff" -> {
+                assertThat(run.queueSize())
+                        .describedAs("%s: the events are KEPT — this is the environment C11/C15 exist for",
+                                entry.scenario())
+                        .isEqualTo(entry.verdicts());
+                assertThat(run.pausedUntil())
+                        .describedAs("%s: the first backoff, jittered around one second", entry.scenario())
+                        .isBetween(NOW + 800L, NOW + 1200L);
+            }
             default -> fail("unknown retry verdict " + entry.retry());
         }
 

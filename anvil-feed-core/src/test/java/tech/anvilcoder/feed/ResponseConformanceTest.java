@@ -134,6 +134,16 @@ class ResponseConformanceTest {
                                 .describedAs(entry.file() + ": the pause is exactly Retry-After")
                                 .isEqualTo(now + entry.retryAfter() * 1000L);
                     }
+                    case "backoff" -> {
+                        assertThat(queue.size())
+                                .describedAs(entry.file() + ": the events are KEPT — a proxy whose "
+                                        + "credentials are fixed five minutes later must cost nothing")
+                                .isEqualTo(2);
+                        assertThat(sender.pausedUntilMillis())
+                                .describedAs(entry.file() + ": the FIRST backoff, jittered around one "
+                                        + "second — not a Retry-After and not a pause of our own choosing")
+                                .isBetween(now + 800L, now + 1200L);
+                    }
                     default -> fail("unknown retry verdict " + entry.retry());
                 }
 
