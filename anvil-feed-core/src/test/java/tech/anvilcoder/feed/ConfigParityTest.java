@@ -87,6 +87,7 @@ class ConfigParityTest {
         actual.put("fingerprint_cap", config.fingerprintCap());
         actual.put("fingerprint_window_ms", config.fingerprintWindowMs());
         actual.put("ignored_request_paths", config.ignoredRequestPaths());
+        actual.put("project_root", config.projectRoot());
 
         List<String> listed = sharedListKeys();
 
@@ -97,7 +98,10 @@ class ConfigParityTest {
 
         for (Map.Entry<String, Object> entry : actual.entrySet()) {
             JsonNode wanted = expected.path(entry.getKey());
-            Object value = wanted.isArray() ? strings(wanted)
+            // `project_root` is the one parameter whose contract value is JSON null — "discovered at
+            // init" — so a null node has to survive as null rather than become the string "null".
+            Object value = wanted.isNull() ? null
+                    : wanted.isArray() ? strings(wanted)
                     : wanted.isNumber() ? (Object) wanted.asInt() : wanted.asText();
             assertThat(entry.getValue()).describedAs(entry.getKey()).isEqualTo(value);
         }

@@ -351,9 +351,15 @@ class AnvilFeedClientTest {
         assertEquals("reportFromCheckout", frames.get(0).get("function"),
                 "the stack starts where the caller called");
         for (Map<String, Object> frame : frames) {
-            assertFalse(String.valueOf(frame.get("file")).contains("tech/anvilcoder/feed"),
+            // The SDK's own files are its MAIN sources. Since frames carry a path relative to
+            // project_root (task 12 fix round, finding 3), "contains tech/anvilcoder/feed" would also
+            // match THIS test class, which lives in the SDK's package and is the legitimate caller here —
+            // an assertion that fails on the caller proves nothing about the callee.
+            assertFalse(String.valueOf(frame.get("file")).contains("src/main/java/tech/anvilcoder/feed/"),
                     "no frame of this SDK is on a synthesised stack: " + frame);
             assertFalse(String.valueOf(frame.get("file")).startsWith("tech.anvilcoder.feed."), "" + frame);
+            assertFalse(String.valueOf(frame.get("file")).startsWith("/"),
+                    "an absolute path never leaves the process: " + frame);
         }
     }
 

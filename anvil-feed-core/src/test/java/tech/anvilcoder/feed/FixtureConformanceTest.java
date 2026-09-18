@@ -210,9 +210,15 @@ class FixtureConformanceTest {
         assertThat(List.copyOf(frame.keySet()))
                 .describedAs("the frame's members and their order are part of the contract")
                 .isEqualTo(List.copyOf(expectedFrame.keySet()));
-        assertThat(frame.get("file"))
+        // Repo-relative where the checkout is on disk, the bare name where it is not (a deployed jar).
+        // Both are asserted as the RULE rather than as one machine's answer, and neither may be absolute.
+        assertThat(String.valueOf(frame.get("file")))
                 .describedAs("the frame is the customer's file, not one of this SDK's")
-                .isEqualTo("ConformanceCaller.java");
+                .endsWith("shop/ConformanceCaller.java");
+        assertThat(String.valueOf(frame.get("file")))
+                .describedAs("an absolute path never leaves the process; project_root is what it is cut "
+                        + "against")
+                .doesNotStartWith("/").doesNotContain(":\\");
         assertThat(frame.get("function")).isEqualTo(expectedFunction);
         assertThat(frame.get("in_app"))
                 .describedAs("a caller's own file is in-app; the fingerprint's promotion depends on it")
@@ -950,7 +956,8 @@ class FixtureConformanceTest {
         assertThat(sent).hasSize(1);
 
         Map<String, Object> frame = map(list(map(sent.get(0).get("exception")).get("stacktrace")).get(0));
-        assertThat(frame.get("file")).isEqualTo("SecretHolder.java");
+        assertThat(String.valueOf(frame.get("file"))).endsWith("shop/SecretHolder.java");
+        assertThat(String.valueOf(frame.get("file"))).doesNotStartWith("/");
         assertThat(String.valueOf(frame.get("context_code")))
                 .describedAs("the context window has to have been read at all, or this test proves nothing")
                 .contains("api_key");

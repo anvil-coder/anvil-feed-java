@@ -211,7 +211,10 @@ class AnvilFeedWebIntegrationTest {
         assertThat(frames).isNotEmpty();
         assertThat(frames).filteredOn(frame -> Boolean.TRUE.equals(frame.get("in_app")))
                 .isNotEmpty()
+                // Repo-relative where the checkout is on disk, the bare name where it is not; never
+                // absolute either way (task 12 fix round, finding 3).
                 .allSatisfy(frame -> assertThat(String.valueOf(frame.get("file")))
-                        .isEqualTo("BookingController.java"));
+                        .endsWith("shop/BookingController.java")
+                        .doesNotStartWith("/"));
     }
 }

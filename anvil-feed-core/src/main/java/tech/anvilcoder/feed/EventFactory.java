@@ -63,8 +63,15 @@ public final class EventFactory {
     /** This SDK's own frames: never the customer's code, and never the head of a synthesised stack. */
     private static final String OUR_OWN = "tech.anvilcoder.feed.";
 
-    /** The same path segment PHP asks about, with both separators (review finding 5). */
-    private static final Pattern VENDOR = Pattern.compile("[\\\\/](vendor|node_modules)[\\\\/]");
+    /**
+     * The same path segment PHP asks about, with both separators (review finding 5).
+     *
+     * <p>The leading segment counts: the path a frame carries is now RELATIVE to {@code project_root}, so a
+     * dependency reads {@code vendor/acme/Client.php} with no separator in front of it. Without the anchor
+     * that is the customer's own code, and {@code in_app} is what {@code IncidentFingerprint.topFrames}
+     * partitions on. PHP's {@code EventFactory::isInApp} carries the same anchor for the same reason.
+     */
+    private static final Pattern VENDOR = Pattern.compile("(^|[\\\\/])(vendor|node_modules)[\\\\/]");
 
     /**
      * The runtime itself, which is nobody's application code. This is the structural half of the rule, not
@@ -107,7 +114,8 @@ public final class EventFactory {
         this.sdkVersion = Objects.requireNonNull(sdkVersion, "sdkVersion");
         this.language = Objects.requireNonNull(language, "language");
         // Once, at construction. Doing it per event would put a directory probe on the capture path.
-        this.sources = SourceContext.discover(config.contextLines(), config.maxContextLineChars());
+        this.sources = SourceContext.discover(config.contextLines(), config.maxContextLineChars(),
+                config.projectRoot() == null ? discoverProjectRoot() : config.projectRoot());
     }
 
     public FeedEvent fromThrowable(Throwable error) {
@@ -205,6 +213,33 @@ public final class EventFactory {
             return false;
         }
         return !VENDOR.matcher(fileOrClass).find();
+    }
+
+    /**
+     * The repository root above {@code user.dir}: the nearest ancestor holding a {@code .git} directory,
+     * and {@code user.dir} itself when there is none.
+     *
+     * <p>Read from {@code user.dir} rather than from the classpath because a JVM has no equivalent of
+     * Composer's autoloader to ask, and the answer has to be the same for a web request, a scheduled job
+     * and a CLI run of the same application — {@code exception.stacktrace[].file} is what the ingest
+     * resolves against the repository (chapter 03 §4.1), so a root that moved with the process would make
+     * one fault look like two files.
+     */
+    public static String discoverProjectRoot() {
+        try {
+            java.nio.file.Path directory = java.nio.file.Path.of(System.getProperty("user.dir", ""))
+                    .toAbsolutePath().normalize();
+            java.nio.file.Path walked = directory;
+            for (int level = 0; level < 12 && walked != null; level++) {
+                if (java.nio.file.Files.isDirectory(walked.resolve(".git"))) {
+                    return walked.toString();
+                }
+                walked = walked.getParent();
+            }
+            return directory.toString();
+        } catch (RuntimeException noWorkingDirectory) {
+            return "";
+        }
     }
 
     /** A canonical UUID v4. The ingest refuses anything else, however reasonable it looks. */
@@ -494,8 +529,12 @@ public final class EventFactory {
             if (frames.size() >= config.maxFrames()) {
                 break;
             }
-            String file = element.getFileName() == null ? element.getClassName() : element.getFileName();
-            boolean inApp = frameIsInApp(element);
+            // Relative to project_root where the source can be found; the file NAME where it cannot — a
+            // deployed jar, a dependency, a synthetic frame. Never an absolute path either way.
+            String resolved = sources.pathFor(element.getClassName(), element.getFileName());
+            String file = resolved != null ? resolved
+                    : element.getFileName() == null ? element.getClassName() : element.getFileName();
+            boolean inApp = frameIsInApp(element, file);
             Map<String, Object> frame = new LinkedHashMap<>();
             frame.put("file", file);
             frame.put("line", Math.max(0, element.getLineNumber()));
@@ -528,15 +567,16 @@ public final class EventFactory {
      * with one of the prefixes; when it is empty nothing changes, which is what a plain {@code java -jar}
      * with no host framework to ask still gets.
      */
-    private boolean frameIsInApp(StackTraceElement element) {
+    private boolean frameIsInApp(StackTraceElement element, String fileOnTheWire) {
         String className = element.getClassName();
         for (String prefix : RUNTIME) {
             if (className.startsWith(prefix)) {
                 return false;
             }
         }
-        if (!isInApp(className)
-                || !isInApp(element.getFileName() == null ? className : element.getFileName())) {
+        // The same path the wire carries is the one the vendor rule is applied to, which is PHP's rule
+        // exactly: a resolved `vendor/…` frame is a dependency in both languages.
+        if (!isInApp(className) || !isInApp(fileOnTheWire)) {
             return false;
         }
         List<String> packages = config.inAppPackages();

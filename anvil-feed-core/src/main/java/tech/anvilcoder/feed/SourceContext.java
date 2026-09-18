@@ -64,6 +64,8 @@ final class SourceContext {
     private final List<Path> roots;
     private final int lines;
     private final int maxLineChars;
+    /** What a resolved path is cut against, or null when nothing can be made relative. */
+    private final Path projectRoot;
 
     /** Access only under its own monitor; {@code accessOrder} true makes {@code get} an LRU touch. */
     private final Map<String, String> cache = new LinkedHashMap<>(64, 0.75f, true) {
@@ -76,33 +78,43 @@ final class SourceContext {
         }
     };
 
-    private SourceContext(List<Path> roots, int lines, int maxLineChars) {
+    private SourceContext(List<Path> roots, int lines, int maxLineChars, Path projectRoot) {
         this.roots = roots;
         this.lines = lines;
         this.maxLineChars = maxLineChars;
+        this.projectRoot = projectRoot;
     }
 
-    /** Discovers the roots once. {@code contextLines == 0} switches the whole thing off, as PHP's does. */
-    static SourceContext discover(int contextLines, int maxLineChars) {
-        if (contextLines <= 0) {
-            return new SourceContext(List.of(), 0, maxLineChars);
-        }
+    /**
+     * Discovers the roots once.
+     *
+     * <p>The roots are looked for whatever {@code contextLines} says, which they were not before the task
+     * 12 fix round: they now answer a second question — {@link #pathFor} — and a frame's {@code file} must
+     * not depend on whether an operator switched context code off. {@code contextLines == 0} still
+     * switches {@link #codeFor} off, exactly as PHP's does; what it costs when it is off is the handful of
+     * {@code isDirectory} probes below, once per process.
+     */
+    static SourceContext discover(int contextLines, int maxLineChars, String projectRoot) {
         List<Path> found = new ArrayList<>();
+        Path root = null;
         try {
             Path directory = Path.of("").toAbsolutePath();
             for (int level = 0; level <= LEVELS && directory != null; level++) {
                 for (String candidate : ROOT_CANDIDATES) {
-                    Path root = directory.resolve(candidate);
-                    if (Files.isDirectory(root)) {
-                        found.add(root);
+                    Path source = directory.resolve(candidate);
+                    if (Files.isDirectory(source)) {
+                        found.add(source);
                     }
                 }
                 directory = directory.getParent();
             }
+            if (projectRoot != null && !projectRoot.isBlank()) {
+                root = Path.of(projectRoot).toAbsolutePath().normalize();
+            }
         } catch (RuntimeException noWorkingDirectory) {
-            return new SourceContext(List.of(), 0, maxLineChars);
+            return new SourceContext(List.of(), 0, maxLineChars, null);
         }
-        return new SourceContext(List.copyOf(found), contextLines, maxLineChars);
+        return new SourceContext(List.copyOf(found), contextLines, maxLineChars, root);
     }
 
     boolean isEmpty() {
@@ -137,6 +149,58 @@ final class SourceContext {
             cache.put(key, found == null ? NO_SOURCE : found);
         }
         return found;
+    }
+
+    /**
+     * The frame's file as it goes ON THE WIRE: the path relative to {@code project_root} when the source
+     * file can be found under one of the roots, and {@code null} when it cannot.
+     *
+     * <p>This is the whole of Java's half of the relative-path rule, and it is smaller than PHP's because
+     * a {@link StackTraceElement} carries only a file NAME. Where a checkout is on disk the name can be
+     * turned back into {@code java/anvil-feed-core/src/test/java/shop/CheckoutService.java}, which is what
+     * the ingest resolves against the repository (chapter 03 §4.1); where it is not — a deployed jar — the
+     * caller falls back to the name, which is still not an absolute path and is therefore still safe to
+     * publish. Cached like {@link #codeFor}, with its own key space, because a miss is the commonest
+     * answer of all and re-answering it would re-probe the filesystem per frame per capture.
+     */
+    String pathFor(String className, String fileName) {
+        if (roots.isEmpty() || className == null || fileName == null || fileName.isBlank()) {
+            return null;
+        }
+        String key = "path\u0000" + className + '/' + fileName;
+        synchronized (cache) {
+            String remembered = cache.get(key);
+            if (remembered != null) {
+                return remembered == NO_SOURCE ? null : remembered;   // identity: our own instance
+            }
+        }
+
+        String found = null;
+        String directory = packagePath(className);
+        for (Path root : roots) {
+            Path candidate = root.resolve(directory).resolve(fileName);
+            try {
+                if (Files.isRegularFile(candidate)) {
+                    found = relativise(candidate);
+                    break;
+                }
+            } catch (RuntimeException unreadable) {
+                break;
+            }
+        }
+        synchronized (cache) {
+            cache.put(key, found == null ? NO_SOURCE : found);
+        }
+        return found;
+    }
+
+    /** Below the project root: the path with the root removed, forward slashes. Above it: the name. */
+    private String relativise(Path file) {
+        Path absolute = file.toAbsolutePath().normalize();
+        if (projectRoot != null && absolute.startsWith(projectRoot)) {
+            return projectRoot.relativize(absolute).toString().replace('\\', '/');
+        }
+        return absolute.getFileName().toString();
     }
 
     /** {@code shop.Checkout$Inner} lives in {@code shop/}; the class name carries the package, the frame not. */

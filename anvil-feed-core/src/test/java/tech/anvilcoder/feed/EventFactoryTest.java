@@ -130,7 +130,59 @@ class EventFactoryTest {
         assertEquals(Boolean.TRUE, frames(narrow).get(0).get("in_app"), "shop.CheckoutService still is");
         assertThat(inApp(narrow))
                 .describedAs("nothing outside the configured packages is the application any more")
-                .containsExactly("CheckoutService.java");
+                .singleElement(org.assertj.core.api.InstanceOfAssertFactories.STRING)
+                .endsWith("shop/CheckoutService.java");
+    }
+
+    /**
+     * Finding 3 of the task-12 fix round, as the claim it is: an absolute path never leaves the process.
+     *
+     * <p>An absolute path carries the deployment layout, the home directory and usually the user name of
+     * whoever the process runs as, into an incident a support engineer — and an agent — reads. It also
+     * makes one fault look like two files when the same service runs from two paths. The server resolves a
+     * frame against the repository (chapter 03 §4.1), so the relative path is the useful one as well as
+     * the safe one. Java's half is smaller than PHP's because a {@link StackTraceElement} carries only a
+     * file NAME; what this asserts is that neither branch of that is ever absolute.
+     */
+    @Test
+    void anAbsolutePathNeverLeavesTheProcess() {
+        List<Map<String, Object>> frames = frames(factory("production", List.of())
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload());
+
+        assertThat(frames).describedAs("a stack with no frames proves nothing here").isNotEmpty();
+        for (Map<String, Object> frame : frames) {
+            assertThat(String.valueOf(frame.get("file")))
+                    .doesNotStartWith("/")
+                    .describedAs("nor a Windows drive letter")
+                    .doesNotContain(":\\");
+        }
+    }
+
+    /**
+     * Where the checkout is on disk the file NAME is turned back into a repo-relative path, which is what
+     * the ingest resolves against the repository. This suite runs from a checkout, so the resolution is
+     * exercised rather than assumed; a deployed jar takes the other branch and sends the bare name.
+     */
+    @Test
+    void aFrameIsResolvedToARepositoryRelativePathWhereTheSourceIsOnDisk() {
+        List<Map<String, Object>> frames = frames(factory("production", List.of())
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload());
+
+        assertThat(String.valueOf(frames.get(0).get("file")))
+                .describedAs("the crash site is shop/CheckoutService.java, resolved under project_root")
+                .endsWith("shop/CheckoutService.java")
+                .contains("src/test/java/");
+    }
+
+    /** The root is discovered from user.dir's git root, not from whatever directory a job happens to run in. */
+    @Test
+    void theProjectRootIsTheGitRootAboveTheWorkingDirectory() {
+        String discovered = EventFactory.discoverProjectRoot();
+
+        assertThat(discovered).isNotBlank();
+        assertThat(java.nio.file.Files.isDirectory(java.nio.file.Path.of(discovered, ".git")))
+                .describedAs("%s is not a git checkout; discovery fell back to user.dir", discovered)
+                .isTrue();
     }
 
     /** The file names of the frames this event calls the application's own. */

@@ -41,7 +41,14 @@ public record AnvilFeedConfig(
         int fingerprintCap,
         int fingerprintWindowMs,
         List<String> ignoredRequestPaths,
-        List<String> inAppPackages) {
+        List<String> inAppPackages,
+        // The directory every exception.stacktrace[].file is sent RELATIVE to, so that no absolute path —
+        // and therefore no deployment layout, home directory or user name — leaves this process. null is
+        // the default and does NOT mean "off": it means DISCOVERED AT INIT, by
+        // EventFactory.discoverProjectRoot(), the git root above user.dir. It stays null here on purpose,
+        // because a discovered absolute path is a property of the machine and not of the configuration
+        // contract — conformance/config-defaults.json says the same for both languages.
+        String projectRoot) {
 
     public static final String DEFAULT_ENDPOINT = "https://app.anvil-coder.tech/api/feed";
 
@@ -139,6 +146,7 @@ public record AnvilFeedConfig(
         private int fingerprintWindowMs = 60_000;
         private List<String> ignoredRequestPaths = List.of("/api/feed/**");
         private List<String> inAppPackages = List.of();
+        private String projectRoot;
         private boolean denylistCleared;
 
         public Builder endpoint(String value) { if (present(value)) { this.endpoint = value.trim(); } return this; }
@@ -166,6 +174,17 @@ public record AnvilFeedConfig(
             }
             return this;
         }
+        /**
+         * What every {@code exception.stacktrace[].file} is cut against, so that no absolute path leaves
+         * the process. {@code null} — the default — means DISCOVERED AT INIT, not "off".
+         */
+        public Builder projectRoot(String value) {
+            if (present(value)) {
+                this.projectRoot = value.trim();
+            }
+            return this;
+        }
+
         public Builder enabled(boolean value) { this.enabled = value; return this; }
         public Builder fingerprintCap(int value) { this.fingerprintCap = value; return this; }
         public Builder fingerprintWindowMs(int value) { this.fingerprintWindowMs = value; return this; }
@@ -237,7 +256,7 @@ public record AnvilFeedConfig(
                     Math.min(400, Math.max(1, maxContextLineChars)),
                     denylist, on, atLeastZero(fingerprintCap, "fingerprint_cap", log),
                     atLeastZero(fingerprintWindowMs, "fingerprint_window_ms", log), ignoredRequestPaths,
-                    inAppPackages);
+                    inAppPackages, projectRoot);
         }
 
         /**

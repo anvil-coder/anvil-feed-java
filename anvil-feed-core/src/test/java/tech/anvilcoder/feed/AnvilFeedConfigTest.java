@@ -66,6 +66,9 @@ class AnvilFeedConfigTest {
         actual.put("fingerprint_cap", config.fingerprintCap());
         actual.put("fingerprint_window_ms", config.fingerprintWindowMs());
         actual.put("ignored_request_paths", config.ignoredRequestPaths());
+        // null, and null is the VALUE the contract names: it means "discovered at init", and a discovered
+        // absolute path is a property of the machine rather than of the contract.
+        actual.put("project_root", config.projectRoot());
 
         assertEquals(expected, actual);
         // A key the fixture grows and this test does not know about is a drift too.
