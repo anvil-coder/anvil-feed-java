@@ -231,7 +231,9 @@ public final class EventFactory {
                     .toAbsolutePath().normalize();
             java.nio.file.Path walked = directory;
             for (int level = 0; level < 12 && walked != null; level++) {
-                if (java.nio.file.Files.isDirectory(walked.resolve(".git"))) {
+                // exists(), not isDirectory(): in a `git worktree` checkout .git is a FILE pointing at the
+                // main repository's gitdir — the exact checkout every review of this SDK runs in.
+                if (java.nio.file.Files.exists(walked.resolve(".git"))) {
                     return walked.toString();
                 }
                 walked = walked.getParent();
