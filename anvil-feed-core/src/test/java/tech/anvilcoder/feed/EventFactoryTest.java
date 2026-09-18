@@ -21,6 +21,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EventFactoryTest {
 
+    private static EventFactory factory(String environment, List<String> inAppPackages) {
+        AnvilFeedConfig config = AnvilFeedConfig.builder()
+                .token("anv_srv_0123456789abcdef0123456789abcdef")
+                .service("shop-api")
+                .environment(environment)
+                .inAppPackages(inAppPackages)
+                .build(FeedLogger.toSystemLogger());
+        return new EventFactory(config, new Scrubber(AnvilFeedConfig.DEFAULT_DENYLIST), GitContext.none());
+    }
+
     private static EventFactory factory(String environment) {
         AnvilFeedConfig config = AnvilFeedConfig.builder()
                 .token("anv_srv_0123456789abcdef0123456789abcdef")
@@ -97,6 +107,47 @@ class EventFactoryTest {
         assertEquals("charge", crashSite.get("function"));
         assertEquals(Boolean.TRUE, crashSite.get("in_app"), "shop.CheckoutService is the customer's code");
         assertThat(frames(payload)).anySatisfy(frame -> assertEquals(Boolean.FALSE, frame.get("in_app")));
+    }
+
+    /**
+     * The structural rule alone cannot tell a library apart from the application inside one flat
+     * class path: JUnit is not the JDK and a fat jar has no {@code vendor/} directory, so every frame of
+     * every dependency is {@code in_app: true} and the fingerprint's in-app partition promotes them over
+     * the application's own frames (task 6 review). {@code in_app_packages} is what a host framework can
+     * answer and the SDK cannot — the Spring starter seeds it from the {@code @SpringBootApplication}
+     * class's package.
+     */
+    @Test
+    void inAppPackagesNarrowTheRuleToTheApplicationsOwnFrames() {
+        Map<String, Object> wide = factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+        assertThat(inApp(wide))
+                .describedAs("without the knob the test runner's own frames count as the application too")
+                .hasSizeGreaterThan(1);
+
+        Map<String, Object> narrow = factory("production", List.of("shop"))
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+        assertEquals(Boolean.TRUE, frames(narrow).get(0).get("in_app"), "shop.CheckoutService still is");
+        assertThat(inApp(narrow))
+                .describedAs("nothing outside the configured packages is the application any more")
+                .containsExactly("CheckoutService.java");
+    }
+
+    /** The file names of the frames this event calls the application's own. */
+    private static List<String> inApp(Map<String, Object> payload) {
+        return frames(payload).stream()
+                .filter(frame -> Boolean.TRUE.equals(frame.get("in_app")))
+                .map(frame -> String.valueOf(frame.get("file")))
+                .toList();
+    }
+
+    /** A prefix that is a package is compared as a package: "sho" is not "shop". */
+    @Test
+    void anInAppPrefixOnlyMatchesAtAPackageBoundary() {
+        Map<String, Object> payload = factory("production", List.of("sho"))
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+
+        assertThat(inApp(payload)).isEmpty();
     }
 
     /**

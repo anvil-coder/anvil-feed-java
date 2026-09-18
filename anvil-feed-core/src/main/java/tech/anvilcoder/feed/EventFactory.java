@@ -517,15 +517,40 @@ public final class EventFactory {
      * {@link #isInApp} plus the one thing a Java stack has and a PHP one does not: the runtime's own
      * frames carry a class name and no dependency path, so the structural question has to be asked of the
      * class name as well.
+     *
+     * <p>And plus the one thing a host framework knows that neither of them does: {@code in_app_packages}.
+     * The structural rule cannot tell {@code com.acme.shop.CheckoutService} from
+     * {@code org.hibernate.engine.StatefulPersistenceContext} — a fat jar has no {@code vendor/} directory
+     * and Hibernate is not the JDK — so every frame of every library is {@code in_app: true}, the
+     * fingerprint's in-app partition promotes a library's frames over the application's own, and two
+     * unrelated faults that both end in Hibernate group together (task 6 review, "the in-app rule is
+     * structural"). When the list is non-empty a frame is the application's only if its CLASS NAME starts
+     * with one of the prefixes; when it is empty nothing changes, which is what a plain {@code java -jar}
+     * with no host framework to ask still gets.
      */
-    private static boolean frameIsInApp(StackTraceElement element) {
+    private boolean frameIsInApp(StackTraceElement element) {
         String className = element.getClassName();
         for (String prefix : RUNTIME) {
             if (className.startsWith(prefix)) {
                 return false;
             }
         }
-        return isInApp(className) && isInApp(element.getFileName() == null ? className : element.getFileName());
+        if (!isInApp(className)
+                || !isInApp(element.getFileName() == null ? className : element.getFileName())) {
+            return false;
+        }
+        List<String> packages = config.inAppPackages();
+        if (packages.isEmpty()) {
+            return true;
+        }
+        for (String prefix : packages) {
+            // "com.acme" matches com.acme.Shop and com.acme.shop.Checkout, and does NOT match
+            // com.acmecorp.Shop — a prefix that is a package is compared as a package.
+            if (className.equals(prefix) || className.startsWith(prefix + ".")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void putIfPresent(Map<String, Object> target, String key, Object value) {

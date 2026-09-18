@@ -40,7 +40,8 @@ public record AnvilFeedConfig(
         boolean enabled,
         int fingerprintCap,
         int fingerprintWindowMs,
-        List<String> ignoredRequestPaths) {
+        List<String> ignoredRequestPaths,
+        List<String> inAppPackages) {
 
     public static final String DEFAULT_ENDPOINT = "https://app.anvil-coder.tech/api/feed";
 
@@ -66,6 +67,7 @@ public record AnvilFeedConfig(
     public AnvilFeedConfig {
         denylist = denylist == null ? DEFAULT_DENYLIST : List.copyOf(denylist);
         ignoredRequestPaths = ignoredRequestPaths == null ? List.of() : List.copyOf(ignoredRequestPaths);
+        inAppPackages = inAppPackages == null ? List.of() : List.copyOf(inAppPackages);
     }
 
     public String eventsUrl() {
@@ -136,6 +138,7 @@ public record AnvilFeedConfig(
         private int fingerprintCap = 10;
         private int fingerprintWindowMs = 60_000;
         private List<String> ignoredRequestPaths = List.of("/api/feed/**");
+        private List<String> inAppPackages = List.of();
         private boolean denylistCleared;
 
         public Builder endpoint(String value) { if (present(value)) { this.endpoint = value.trim(); } return this; }
@@ -170,6 +173,21 @@ public record AnvilFeedConfig(
         public Builder ignoredRequestPaths(List<String> value) {
             if (value != null) {
                 this.ignoredRequestPaths = strings(value);
+            }
+            return this;
+        }
+
+        /**
+         * The packages that ARE the application, for {@code exception.stacktrace[].in_app}. An EMPTY list
+         * is honoured and is the default: it means "decide structurally", which is the rule
+         * {@link EventFactory#isInApp} has always applied and the only one a plain {@code java -jar} can
+         * apply on its own. A non-empty list narrows the answer to frames whose class name starts with one
+         * of these prefixes, which is what a host framework can know and the SDK cannot — the Spring
+         * starter seeds it from the {@code @SpringBootApplication} class's package.
+         */
+        public Builder inAppPackages(List<String> value) {
+            if (value != null) {
+                this.inAppPackages = strings(value);
             }
             return this;
         }
@@ -218,7 +236,8 @@ public record AnvilFeedConfig(
                     Math.min(50, Math.max(1, maxFrames)), Math.min(20, Math.max(0, contextLines)),
                     Math.min(400, Math.max(1, maxContextLineChars)),
                     denylist, on, atLeastZero(fingerprintCap, "fingerprint_cap", log),
-                    atLeastZero(fingerprintWindowMs, "fingerprint_window_ms", log), ignoredRequestPaths);
+                    atLeastZero(fingerprintWindowMs, "fingerprint_window_ms", log), ignoredRequestPaths,
+                    inAppPackages);
         }
 
         /**

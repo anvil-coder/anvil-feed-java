@@ -106,14 +106,25 @@ class ConfigParityTest {
     /**
      * The components of {@link AnvilFeedConfig} that deliberately have no entry in the shared list, each
      * with the reason it has none. Adding a name here is how a knob LEAVES the parity contract, and it has
-     * to be a decision somebody wrote down rather than a silent omission. The four are the same four PHP's
-     * twin exempts, spelled the same way.
+     * to be a decision somebody wrote down rather than a silent omission. The first four are the same four
+     * PHP's twin exempts, spelled the same way.
+     *
+     * <p>The fifth, {@code in_app_packages}, is the exception that has to be read rather than copied. It
+     * is a real knob with a real default (the empty list) and it BELONGS in the shared list the day PHP
+     * grows a namespace equivalent — task 9's handover says so. It is exempt today because the shared list
+     * is a two-language contract: adding the key to {@code conformance/config-defaults.json} makes PHP's
+     * {@code testEveryDefaultMatchesTheSharedList} red for a parameter PHP does not have, and the Spring
+     * starter (task 10) needs the knob now. The exemption is therefore the DECISION "Java first, PHP next"
+     * written down where it is read, and not a silent omission. Task 11 / the spec owners move it into the
+     * shared list together with PHP's half, in one change to both languages.
      */
     private static final Map<String, String> NOT_IN_THE_SHARED_LIST = Map.of(
             "token", "no default: without it the SDK is switched off rather than guessing one",
             "service", "no default: without it the SDK is switched off rather than guessing one",
             "release", "no default: unset means \"read it from git or send none\"",
-            "enabled", "derived from the three above, not a value an operator sets on its own");
+            "enabled", "derived from the three above, not a value an operator sets on its own",
+            "inAppPackages", "Java-only today: the shared list is a two-language contract and PHP has no "
+                    + "namespace equivalent yet. It joins the list together with PHP's half.");
 
     /**
      * The other direction, and the one this test was missing: every component {@link AnvilFeedConfig}
