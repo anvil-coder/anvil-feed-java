@@ -19,6 +19,26 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * answers are consumed in order, and the default answer once they run out is the one a healthy ingest
  * gives — {@code 202} naming every id that was posted, never a filler {@code accepted: []}, which is a
  * response the real server never sends and which the sender is required to notice.
+ *
+ * <p><b>Task 11 looked at making this one double and decided against it, so that the next reader does
+ * not have to look again.</b> The move would be {@code java-test-fixtures} on {@code anvil-feed-core}
+ * plus {@code testImplementation(testFixtures(project(":anvil-feed-core")))} here, and it is not clean
+ * for three reasons that compound:
+ *
+ * <ol>
+ *   <li>this class is a strict SUPERSET of {@code RecordingTransport} — {@link #rejecting} and
+ *       {@link #throwing} have no counterpart there — so the core's double would have to GROW two
+ *       behaviours it does not need, for a consumer's benefit;</li>
+ *   <li>{@code RecordingTransport} is package-private. A test-fixtures source set publishes a real
+ *       variant, so the class would become public API of a third artifact — and what gets published,
+ *       under which coordinate, is one of the open owner decisions this version deliberately does not
+ *       take;</li>
+ *   <li>it changes the source-set layout of a module that has been reviewed and is green.</li>
+ * </ol>
+ *
+ * <p>The duplication that actually matters — two suites disagreeing about what the transport contract
+ * is — is not present: both drive the core's own public {@link Transport} interface, and both answer a
+ * healthy batch by naming every id that was posted.
  */
 final class StubIngest implements Transport {
 
