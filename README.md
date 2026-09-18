@@ -94,3 +94,7 @@ decisions are in that file's header and in the root [`README.md`](../README.md).
 Until then, a consuming Gradle project uses a composite build — `includeBuild("…/anvil-feed/java")`
 and a versionless coordinate. The guide has the exact lines, and they were run against a scratch
 project.
+
+## Toolchain provisioning and egress
+
+With no JDK 25 installed, `settings.gradle.kts` resolves the toolchain through **`api.foojay.io`** (the Foojay resolver convention) and downloads Temurin 25. On a host with no egress to that API, install a JDK 25 first — CI does exactly that with `actions/setup-java` before Gradle starts, so the call never happens there. Details in the root README.
