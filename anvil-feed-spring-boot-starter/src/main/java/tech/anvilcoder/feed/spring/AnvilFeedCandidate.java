@@ -63,6 +63,28 @@ final class AnvilFeedCandidate {
         return context;
     }
 
+    /**
+     * Fills in the status the client really saw, once it is known.
+     *
+     * <p>The context is built where the fault is seen, and there the response is still 200 — FR-6 (c) says
+     * a field that cannot be determined is left out, so it was. By the time the dispatch has finished the
+     * status IS determined, and an incident that names the 500 the caller got is worth more than one that
+     * names nothing. An existing value is never overwritten: a status the exception itself declared is the
+     * more specific fact.
+     */
+    @SuppressWarnings("unchecked")
+    void observedStatus(int status) {
+        try {
+            if (status < 100 || !(context.get("request") instanceof Map<?, ?> block)) {
+                return;
+            }
+            Map<String, Object> request = (Map<String, Object>) block;
+            request.putIfAbsent("status_code", status);
+        } catch (RuntimeException | Error ours) {
+            // An unmodifiable context costs the field, never the event. FR-2 b.
+        }
+    }
+
     /** True the first time; the request is single-threaded at both call sites. */
     boolean claim() {
         if (reported) {

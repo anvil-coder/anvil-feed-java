@@ -38,23 +38,33 @@ import tech.anvilcoder.feed.AnvilFeedClient;
  * <table>
  *   <caption>The four classes</caption>
  *   <tr><th>Class</th><th>Example</th><th>Reported</th></tr>
- *   <tr><td>resolved by an application {@code @ExceptionHandler} / {@code @ControllerAdvice}</td>
- *       <td>{@code ValidationException → 400}</td><td><b>no</b> — it is a deliberate answer</td></tr>
  *   <tr><td>the exception DECLARES a 4xx</td>
  *       <td>{@code ResponseStatusException(404)}, {@code NoResourceFoundException},
- *           {@code @ResponseStatus(BAD_REQUEST)}</td><td><b>no</b> — a client error</td></tr>
+ *           {@code @ResponseStatus(BAD_REQUEST)}</td><td><b>no</b> — a client error, whatever renders it</td></tr>
  *   <tr><td>the exception DECLARES a 5xx</td>
- *       <td>{@code ResponseStatusException(BAD_GATEWAY)}</td><td><b>yes</b></td></tr>
- *   <tr><td>nothing resolved it</td><td>an {@code IllegalStateException} out of a controller</td>
+ *       <td>{@code ResponseStatusException(BAD_GATEWAY)}</td><td><b>yes</b> — whatever renders it</td></tr>
+ *   <tr><td>everything else, and the request ends <b>below 500</b></td>
+ *       <td>a {@code @ControllerAdvice} mapping {@code Declined → 402}</td>
+ *       <td><b>no</b> — a deliberate answer</td></tr>
+ *   <tr><td>everything else, and the request ends at <b>500 or above</b> — or nothing resolved it at all</td>
+ *       <td>a {@code @ControllerAdvice} turning a {@code NullPointerException} into a 500
+ *           {@code ProblemDetail}; an {@code IllegalStateException} out of a controller</td>
  *       <td><b>yes</b></td></tr>
  * </table>
  *
  * <p>"Declares" is {@link ErrorResponse} or {@code @ResponseStatus} — the exception's own type, never the
- * response, which is still 200 at this point. "Resolved by an application handler" cannot be observed
- * here at all: this resolver runs first, and whether an {@code @ExceptionHandler} matches is decided
- * afterwards. So a fault with no declared status is PARKED as an {@link AnvilFeedCandidate} and
- * {@link AnvilFeedRequestFilter} reaches the verdict one layer out, where the answer is unambiguous — a
- * dispatch that resolved the exception returns, a dispatch that did not rethrows it.
+ * response, which is still 200 at this point. For everything else the authority is <b>the status the
+ * client actually saw</b>, and that cannot be observed here: this resolver runs first, before any handler
+ * has written anything. So a fault with no declared status is PARKED as an {@link AnvilFeedCandidate} and
+ * {@link AnvilFeedRequestFilter} reaches the verdict one layer out, after the whole dispatch — which is
+ * also the only place that sees a {@code response.sendError(500)} or a container's ERROR dispatch.
+ *
+ * <p>Deciding on the status rather than on who handled it is deliberate and was the correction of fix
+ * round 2. A rule of "an application handler means not an incident" loses the commonest global-error-handler
+ * idiom in Spring — a {@code @ControllerAdvice} that turns any unexpected {@code RuntimeException} into a
+ * 500 {@code ProblemDetail} — and that is the one fault a repair agent most wants. It is also what
+ * Laravel's {@code shouldReport()} does: rendering a custom response has never made a fault unreportable
+ * there either.
  */
 public final class AnvilFeedExceptionResolver implements HandlerExceptionResolver, Ordered {
 

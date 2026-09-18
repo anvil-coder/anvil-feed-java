@@ -106,13 +106,45 @@ class AnvilFeedWebIntegrationTest {
 
     // ------------------------------------------------------------- the gate, end to end
 
-    /** Class 1: the application's own {@code @RestControllerAdvice} answered it. A deliberate 402. */
+    /**
+     * The same advice, on the same kind of exception — no declared status — answering 402. Below 500 is a
+     * deliberate answer, so nothing is filed. The pair of this test and the two above IS the rule: the
+     * difference between them is the status the client saw, and nothing else.
+     */
     @Test
-    void anExceptionAnApplicationHandlerAnsweredIsNotAnIncident() throws Exception {
+    void anExceptionAnApplicationHandlerAnsweredBelow500IsNotAnIncident() throws Exception {
         mockMvc.perform(get("/pay")).andExpect(result ->
                 assertEquals(402, result.getResponse().getStatus()));
 
         assertEquals(0, client.queue().size(), "a handled exception is a deliberate answer, not a fault");
+    }
+
+    /**
+     * The correction of fix round 2, and the single most common global-error-handler idiom in Spring: a
+     * {@code @ControllerAdvice} turns an unexpected {@code NullPointerException} into a 500
+     * {@code ProblemDetail}. The client saw a server failure, so it is an incident — and the event is
+     * about the NPE itself, not about anything the servlet or the advice wrapped it in.
+     */
+    @Test
+    void aHandlerThatRendersA500StillProducesExactlyOneEventAboutTheOriginalFault() throws Exception {
+        mockMvc.perform(get("/unexpected")).andExpect(result ->
+                assertEquals(500, result.getResponse().getStatus()));
+
+        assertEquals(1, client.queue().size());
+        Map<String, Object> payload = client.queue().take(1).get(0).payload();
+        assertEquals("java.lang.NullPointerException", map(payload.get("exception")).get("type"));
+        assertEquals(500, map(payload.get("request")).get("status_code"));
+        assertEquals("/unexpected", map(payload.get("tags")).get("route"));
+    }
+
+    /** The same advice, a 503: any status at or above 500 is a server failure. */
+    @Test
+    void aHandlerThatRenders503IsAlsoAnIncident() throws Exception {
+        mockMvc.perform(get("/overloaded")).andExpect(result ->
+                assertEquals(503, result.getResponse().getStatus()));
+
+        assertEquals(1, client.queue().size());
+        assertEquals(503, map(client.queue().take(1).get(0).payload().get("request")).get("status_code"));
     }
 
     /** Class 2: the exception declares a 404. */

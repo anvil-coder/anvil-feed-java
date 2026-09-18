@@ -112,18 +112,55 @@ class AnvilFeedRequestFilterTest {
         assertEquals("java.lang.IllegalStateException", map(onlyEvent(client).get("exception")).get("type"));
     }
 
-    /** The dispatch returned, so an application {@code @ExceptionHandler} answered it. Not an incident. */
+    /** The dispatch returned with a 402: a deliberate answer, not an incident. */
     @Test
-    void aParkedFaultAnApplicationHandlerResolvedIsDropped() throws Exception {
+    void aParkedFaultAnsweredBelow500IsDropped() throws Exception {
+        assertEquals(0, throughAHandlerAnswering(402), "a handled exception is a deliberate answer");
+    }
+
+    /**
+     * The dispatch returned with a 500: whoever rendered it, the client saw a server failure. This is the
+     * {@code @ControllerAdvice}-to-{@code ProblemDetail} idiom, and it is the one fault a repair agent
+     * most wants.
+     */
+    @Test
+    void aParkedFaultAnsweredWithA500IsAnIncident() throws Exception {
+        assertEquals(1, throughAHandlerAnswering(500));
+    }
+
+    /** {@code sendError} commits the response inside the dispatch; the status is still the authority. */
+    @Test
+    void aCommittedErrorResponseIsReadTheSameWay() throws Exception {
         AnvilFeedClient client = AnvilFeedTestSupport.client();
-        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/pay");
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/bookings/4711");
+        MockHttpServletResponse response = new MockHttpServletResponse();
         AnvilFeedTestSupport.resolver(client)
                 .resolveException(request, new MockHttpServletResponse(), null, CheckoutService.charge());
 
-        AnvilFeedTestSupport.filter(client).doFilter(request, new MockHttpServletResponse(),
-                new MockFilterChain());
+        AnvilFeedTestSupport.filter(client).doFilter(request, response, new MockFilterChain() {
+            @Override
+            public void doFilter(jakarta.servlet.ServletRequest inner,
+                                 jakarta.servlet.ServletResponse outer) throws java.io.IOException {
+                ((MockHttpServletResponse) outer).sendError(503);
+            }
+        });
 
-        assertEquals(0, client.queue().size(), "a handled exception is a deliberate answer");
+        assertEquals(1, client.queue().size());
+        assertEquals(503, map(AnvilFeedTestSupport.onlyEvent(client).get("request")).get("status_code"));
+    }
+
+    /** One dispatch through a handler that answers {@code status}; the number of events it produced. */
+    private static int throughAHandlerAnswering(int status) throws Exception {
+        AnvilFeedClient client = AnvilFeedTestSupport.client();
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/pay");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AnvilFeedTestSupport.resolver(client)
+                .resolveException(request, new MockHttpServletResponse(), null, CheckoutService.charge());
+
+        response.setStatus(status);
+        AnvilFeedTestSupport.filter(client).doFilter(request, response, new MockFilterChain());
+
+        return client.queue().size();
     }
 
     /** The faults nobody sees: an exception from another filter never reaches the dispatcher servlet. */

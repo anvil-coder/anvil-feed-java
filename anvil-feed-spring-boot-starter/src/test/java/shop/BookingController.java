@@ -48,6 +48,22 @@ public class BookingController {
         throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "the payment provider is down");
     }
 
+    /**
+     * The fault nobody expected: no declared status, and the application's own advice turns it into a 500
+     * {@code ProblemDetail}. The client saw a server failure, so it is an incident — and the event has to
+     * be about the {@code NullPointerException}, not about anything wrapping it.
+     */
+    @GetMapping("/unexpected")
+    public String unexpected() {
+        throw new NullPointerException("Cannot invoke \"Cart.total()\" because \"cart\" is null");
+    }
+
+    /** No declared status either, and the advice answers 503: still a server failure. */
+    @GetMapping("/overloaded")
+    public String overloaded() {
+        throw new Overloaded("the booking engine is saturated");
+    }
+
     /** Spring's own {@code MissingServletRequestParameterException}: an ErrorResponse with a 400. */
     @GetMapping("/search")
     public String search(@RequestParam("q") String query) {
