@@ -175,7 +175,7 @@ class MockServerTest {
                     node.path("retry").asText(),
                     Math.max(1, body.path("accepted").size() + body.path("rejected").size())));
         }
-        assertThat(entries).hasSizeGreaterThanOrEqualTo(11);
+        assertThat(entries).hasSizeGreaterThanOrEqualTo(12);
         return entries.stream();
     }
 
