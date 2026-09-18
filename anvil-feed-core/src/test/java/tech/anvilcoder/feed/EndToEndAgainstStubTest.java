@@ -65,6 +65,9 @@ class EndToEndAgainstStubTest {
     /** The run whose single accepted request {@code conformance/stub/compare.mjs} reads. */
     private static final String CROSS_LANGUAGE_RUN = "c9";
 
+    /** The message BOTH SDKs throw, so that {@code exception.message} can be compared rather than masked. */
+    private static final String CROSS_LANGUAGE_MESSAGE = "Cannot read property id of undefined";
+
     /**
      * The context both SDKs capture with, so that the two wire bodies can be compared field for field.
      * Its PHP twin is {@code AgainstStubTest::CROSS_LANGUAGE_CONTEXT}; the two lists are held together by
@@ -94,6 +97,9 @@ class EndToEndAgainstStubTest {
 
         ProcessBuilder builder = new ProcessBuilder("node", CONFORMANCE.resolve("stub/server.mjs").toString());
         builder.environment().put("STUB_JOURNAL", journal.toString());
+        // `testing` is a binding the operator switched OFF, which is one of the four answers a first
+        // integration meets and the only one no other scenario can produce.
+        builder.environment().put("STUB_DISABLED_ENVIRONMENTS", "testing");
         builder.redirectErrorStream(true);
         try {
             stub = builder.start();
@@ -309,7 +315,8 @@ class EndToEndAgainstStubTest {
     void aRealExceptionIsAcceptedAndWhatWentOnTheWireIsSchemaValid() throws Exception {
         install(CROSS_LANGUAGE_RUN);
 
-        String id = ConformanceCaller.fail(CheckoutService.charge(), CROSS_LANGUAGE_CONTEXT);
+        String id = ConformanceCaller.fail(CheckoutService.failWith(CROSS_LANGUAGE_MESSAGE),
+                CROSS_LANGUAGE_CONTEXT);
         assertThat(id).isNotNull();
         AnvilFeed.flush();
 
@@ -339,6 +346,10 @@ class EndToEndAgainstStubTest {
         assertThat(body.path("user").path("id").asText()).isEqualTo("u-4711");
         assertThat(body.path("breadcrumbs").toString()).isEqualTo("[\"cart.add sku=A1\",\"checkout.start\"]");
         assertThat(body.path("tags").path("tier").asText()).isEqualTo("gold");
+        assertThat(body.path("exception").path("message").asText())
+                .describedAs("the message is what compare.mjs holds the two SDKs to; the type and the "
+                        + "frames it cannot")
+                .isEqualTo(CROSS_LANGUAGE_MESSAGE);
         assertThat(client.queue().size()).describedAs("an accepted event is cleared").isZero();
         assertThat(client.sender().isStopped()).isFalse();
     }
@@ -455,9 +466,8 @@ class EndToEndAgainstStubTest {
         List<JsonNode> resumed = journal("ratelimit");
         assertThat(resumed).describedAs("at the deadline the send resumes").hasSize(2);
         assertThat(resumed.get(1).path("status").asInt()).isEqualTo(202);
-        // Measured against the STUB's own timestamps as well as the injected clock.
-        assertThat(resumed.get(1).path("at").asLong())
-                .isGreaterThanOrEqualTo(entries.get(0).path("at").asLong());
+        // The proof is the COUNT after +59 s, not a wall-clock stamp: the stub's `at` is real time and the
+        // SDK's clock is injected, so comparing them would assert that this machine's clock runs forwards.
     }
 
     /**
@@ -474,8 +484,10 @@ class EndToEndAgainstStubTest {
         List<JsonNode> entries = journal("unauthorized");
         assertThat(entries).hasSize(1);
         assertThat(entries.get(0).path("status").asInt()).isEqualTo(401);
-        assertThat(entries.get(0).path("body").isNull())
-                .describedAs("a 401 is bare — the body is never parsed").isTrue();
+        assertThat(entries.get(0).path("headers").path("authorization").asText())
+                .describedAs("the SDK presented the token it was configured with; the 401 was EARNED by "
+                        + "that token and not by a request the ingest could not read")
+                .isEqualTo("Bearer anv_srv_… (17 characters)");
         assertThat(client.sender().isStopped()).isTrue();
         assertThat(client.queue().size()).describedAs("the queue is drained, not retried").isZero();
 
@@ -615,6 +627,103 @@ class EndToEndAgainstStubTest {
         AnvilFeed.flush();
         assertThat(journal("nobinding"))
                 .describedAs("a 4xx-equivalent verdict is never retried").hasSize(1);
+    }
+
+    /**
+     * A binding that exists and is switched off. It is the third of the four verdicts a first integration
+     * meets, it is FINAL — the event is not resent — and it is the one an SDK is most tempted to retry,
+     * because a 202 with an empty `accepted` list looks like nothing happened.
+     */
+    @Test
+    void aDisabledBindingIsFinalAndTheEventIsNotResent() throws Exception {
+        install("bindingdisabled", "accepted", (builder) -> builder.environment("testing"));
+
+        ConformanceCaller.verifyTheIntegration();
+        AnvilFeed.flush();
+
+        List<JsonNode> entries = journal("bindingdisabled");
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).path("response").path("rejected").path(0).path("reason_code").asText())
+                .isEqualTo("binding_disabled");
+        assertThat(client.queue().size()).isZero();
+        assertThat(client.sender().isStopped()).isFalse();
+
+        AnvilFeed.flush();
+        assertThat(journal("bindingdisabled")).hasSize(1);
+    }
+
+    /**
+     * A server that answers the status line and then withholds the body past any sane request budget. The
+     * event is KEPT — a read timeout is transient and the batch has not been refused — the sender is not
+     * stopped, and the whole flush returns long before the stub would have finished.
+     *
+     * <p>The elapsed time is measured rather than slept through: the assertion is that the budget reached
+     * the socket, and a flush that took the stub's five seconds would fail it.
+     */
+    @Test
+    void aSlowIngestIsATransientFailureBoundedByTheConfiguredBudget() throws Exception {
+        install("slowingest", "slow", (builder) -> builder.requestTimeoutMs(300).connectTimeoutMs(300));
+
+        ConformanceCaller.fail(CheckoutService.charge(), Map.of());
+        long startedAt = System.nanoTime();
+        AnvilFeed.flush();
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+        assertThat(journal("slowingest")).describedAs("the request did reach the stub").hasSize(1);
+        assertThat(elapsedMs)
+                .describedAs("the 300 ms budget has to reach the socket; the stub withholds the body for "
+                        + "five seconds")
+                .isLessThan(3_000L);
+        assertThat(client.queue().size()).describedAs("a read timeout is transient, not a refusal")
+                .isEqualTo(1);
+        assertThat(client.sender().isStopped()).isFalse();
+        assertThat(written.matching("transport failure")).isNotEmpty();
+    }
+
+    /**
+     * The two long-window answers of {@code conformance/responses/index.json}. 137 and 900 are deliberately
+     * not the documented 60 and 30: an SDK that lost the {@code Retry-After} header and fell back to its
+     * own constant is indistinguishable from one that read it, for as long as every answer carries the
+     * default.
+     */
+    @Test
+    void thePauseIsTheRetryAfterTheServerSentAndNotAConstantTheSdkKnows() throws Exception {
+        script("longwindow", "rate-limited-long-window");
+        install("longwindow");
+        ConformanceCaller.fail(CheckoutService.charge(), Map.of());
+        AnvilFeed.flush();
+        assertThat(journal("longwindow").get(0).path("retry_after").asText()).isEqualTo("137");
+        assertThat(client.sender().pausedUntilMillis()).isEqualTo(now + 137_000L);
+
+        takeTheFacadeDown();
+        script("longwindow2", "transient-long-window");
+        install("longwindow2");
+        ConformanceCaller.fail(CheckoutService.charge(), Map.of());
+        AnvilFeed.flush();
+        assertThat(journal("longwindow2").get(0).path("retry_after").asText()).isEqualTo("900");
+        assertThat(client.sender().pausedUntilMillis()).isEqualTo(now + 900_000L);
+        assertThat(client.queue().size()).describedAs("a 503 keeps the whole batch").isEqualTo(1);
+    }
+
+    /**
+     * The mapper trims nothing: a padded id reaches {@code UUID.fromString} with its padding
+     * ({@code AnvilFeedEventMapper.java:97-114}). A stub that trimmed first would answer 202 to a body the
+     * running ingest refuses per event — which is the proxy this whole task exists to make expensive.
+     */
+    @Test
+    void aPaddedEventIdIsRefusedBecauseTheMapperTrimsNothing() throws Exception {
+        com.fasterxml.jackson.databind.node.ObjectNode event =
+                (com.fasterxml.jackson.databind.node.ObjectNode)
+                        JSON.readTree(Files.readString(CONFORMANCE.resolve("valid/minimal.json")));
+        event.put("event_id", "  " + event.path("event_id").asText() + "  ");
+
+        HttpResponse<String> answer = post("/raw/accepted/api/feed/events", JSON.writeValueAsString(event));
+        JsonNode body = JSON.readTree(answer.body());
+
+        assertThat(answer.statusCode()).isEqualTo(202);
+        assertThat(body.path("accepted")).isEmpty();
+        assertThat(body.path("rejected").path(0).path("reason_code").asText()).isEqualTo("schema_violation");
+        assertThat(body.path("rejected").path(0).path("message").asText()).contains("canonical UUID");
     }
 
     /** Disabled is the fourth verdict, and it reaches no socket at all. */
