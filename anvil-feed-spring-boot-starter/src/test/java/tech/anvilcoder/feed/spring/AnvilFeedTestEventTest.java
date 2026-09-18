@@ -46,7 +46,7 @@ class AnvilFeedTestEventTest {
         Run run = run(config(), new StubIngest());
 
         assertThat(run.lines()).anyMatch(line -> line.equals("verdict:     accepted"));
-        assertThat(run.lines()).anyMatch(line -> line.startsWith("Search the Anvil cockpit inbox for "));
+        assertThat(run.lines()).anyMatch(line -> line.startsWith("Open the project's Incidents inbox"));
         assertThat(run.lines()).anyMatch(line -> line.startsWith("event_id:    "));
     }
 

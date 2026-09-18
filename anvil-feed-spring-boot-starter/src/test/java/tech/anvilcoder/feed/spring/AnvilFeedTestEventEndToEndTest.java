@@ -122,7 +122,7 @@ class AnvilFeedTestEventEndToEndTest {
         Run run = run("accepted", (builder) -> builder.token(TOKEN));
 
         assertThat(run.lines()).contains("verdict:     accepted");
-        assertThat(run.lines()).anyMatch(line -> line.startsWith("Search the Anvil cockpit inbox for "));
+        assertThat(run.lines()).anyMatch(line -> line.startsWith("Open the project's Incidents inbox"));
         assertThat(run.exitCode()).isZero();
     }
 

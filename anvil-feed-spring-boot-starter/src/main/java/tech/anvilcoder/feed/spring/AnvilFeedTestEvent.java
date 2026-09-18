@@ -152,7 +152,7 @@ public final class AnvilFeedTestEvent implements CommandLineRunner, ExitCodeGene
             lines.add("             " + detail);
         }
         if ("accepted".equals(read.outcome())) {
-            lines.add("Search the Anvil cockpit inbox for " + id + ". It is there within a minute.");
+            lines.add("Open the project's Incidents inbox in the Anvil cockpit: the newest row is the test event (exception type ending in TestEvent) under your service name, within a minute. Event id " + id + ".");
         }
         return lines;
     }
