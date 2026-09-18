@@ -529,8 +529,30 @@ public final class EventFactory {
         return value == null ? null : Json.text(value);
     }
 
-    /** @return the status as the schema's {@code integer}, or {@code null} when it is not one. */
+    /**
+     * @return the status as the schema's {@code integer}, or {@code null} when it is not one.
+     *
+     * <p>A FLOATING-POINT value is only a status code when it IS an integer: {@code 200.0} is the 200 a
+     * JSON or properties hop turned into a double, and {@code 200.5} is not a status at all.
+     * {@code intValue()} alone truncated every one of them — {@code 200.5} became 200, {@code -0.5} and
+     * {@code NaN} became 0, and {@code Infinity} became 2147483647, each of them shown in a cockpit as a
+     * fact the caller never stated. Dropping is the same answer the string branch below gives to
+     * {@code "200.5"}, and the same one PHP's {@code asInteger} gives (task-9 parity list).
+     */
     private static Integer asInteger(Object value) {
+        if (value instanceof Double || value instanceof Float) {
+            double asDouble = ((Number) value).doubleValue();
+            return Double.isFinite(asDouble) && asDouble == Math.rint(asDouble)
+                    && asDouble >= Integer.MIN_VALUE && asDouble <= Integer.MAX_VALUE
+                    ? Integer.valueOf((int) asDouble) : null;
+        }
+        if (value instanceof java.math.BigDecimal decimal) {
+            try {
+                return decimal.intValueExact();
+            } catch (ArithmeticException notAWholeNumber) {
+                return null;
+            }
+        }
         if (value instanceof Number number) {
             return number.intValue();
         }
