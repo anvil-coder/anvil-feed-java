@@ -27,8 +27,22 @@ import java.util.regex.Pattern;
  * ingest forms the pseudonym from the connection address itself; a value we sent would be either a guess
  * or an address.
  *
+ * <p><b>Idempotent.</b> {@code scrub(scrub(x))} equals {@code scrub(x)} for every payload, and
+ * {@code scrubText} leaves an already-filtered text byte-identical — quoted values included. That is not
+ * a nicety: {@link EventFactory#finalise} is public so that a {@code beforeSend} hook's output takes the
+ * same pipeline, which means every scrub rule here runs at least twice over a hooked event.
+ *
  * <p>It is pattern work, not a proof. A secret with no recognisable shape survives, which is why the
  * server redacts again on its own side. What this buys is that it never leaves this process.
+ *
+ * <p><b>JSON-shaped text is deliberately not scrubbed</b> (review finding 14), in both languages:
+ * {@code {"password": "hunter2"}} comes back unchanged, because the key rule needs the separator directly
+ * after the word boundary and finds a quote instead. Letting the rule see a quote before the separator
+ * would catch it, and it is a spec decision rather than a silent fix — the server's own
+ * {@code IncidentRedaction.JSON_SECRET} is what catches this shape today, before anything is stored.
+ *
+ * <p>Immutable and safe to share across threads: the compiled patterns and the term list are final and
+ * {@link Pattern} is thread-safe.
  */
 public final class Scrubber {
 
@@ -57,17 +71,37 @@ public final class Scrubber {
             }
         }
         if (terms.isEmpty()) {
-            terms = AnvilFeedConfig.DEFAULT_DENYLIST;
-            for (String term : terms) {
-                normalizedTerms.add(term.replaceAll("[^a-z0-9]", ""));
-            }
+            // An EMPTY denylist is honoured (review finding 7): the operator asked for no key rule and
+            // gets none. What it must NOT become is an empty alternation — `/\b()\b\s*[:=]\s*…/` matches
+            // at every colon and every equals sign in every text the SDK touches, which is how PHP's
+            // fromArray([]) behaves today and is a defect there, not a contract. The Bearer pass, the
+            // url rules and the user.ip removal are absolutes and keep running.
+            this.keyValue = null;
+            return;
         }
         // "api_key" also matches "api-key", "apiKey" and "API KEY"; "credit_card" likewise.
         String alternatives = String.join("|", terms.stream()
                 .map(term -> Pattern.quote(term).replace("_", "\\E[-_ ]?\\Q"))
                 .toList());
-        this.keyValue = Pattern.compile("(?i)\\b(" + alternatives + ")\\b(\\s*[:=]\\s*)"
-                + "(?!\\[Filtered\\])(?!Bearer\\b)([\"']?)([^\\s\"',;&)}\\]]+)\\3?");
+        // The quote group comes BEFORE the two lookaheads, and that order is the whole of review finding 1.
+        // With the guard in front, a second pass over `token="[Filtered]"` read the lookahead against the
+        // QUOTE — which is not `[Filtered]`, so it passed — the value class then stopped at the `]` it
+        // excludes, and the leftover `]"` survived in the tail: `token="[Filtered]"]"`, two more characters
+        // on every further pass, on the one path (a beforeSend hook's output) the contract calls safe to
+        // run twice. Behind the quote the guard sees the value a reader sees, so an already-filtered value,
+        // quoted or not, matches nothing and comes back byte-identical — and `Authorization: "Bearer
+        // [Filtered]"` keeps the scheme the pass above deliberately kept.
+        //
+        // The value class stays the SERVER's own (IncidentRedaction.KV_SECRET, `[^\s"',;&)}\]]+`):
+        // excluding `)}]` is what keeps `(token=abc)` from losing its bracket, and dropping them — the
+        // Java review's suggested fix — would have eaten it.
+        //
+        // One shape is knowingly given up by the move, in both languages: a quoted value that is LITERALLY
+        // the word `Bearer` (`token="Bearer"`) is no longer redacted here, because `(?!Bearer\b)` now fires
+        // once the quote is consumed. No credential has that shape — `Bearer` is the scheme keyword, not a
+        // token — and IncidentRedaction on the server is the backstop before anything is stored or shown.
+        this.keyValue = Pattern.compile("(?i)\\b(" + alternatives + ")\\b(\\s*[:=]\\s*)([\"']?)"
+                + "(?!\\[Filtered\\])(?!Bearer\\b)([^\\s\"',;&)}\\]]+)\\3?");
     }
 
     /**
@@ -110,6 +144,9 @@ public final class Scrubber {
         }
         // The scheme survives; the value does not.
         String withoutBearer = BEARER.matcher(text).replaceAll("Bearer " + Matcher.quoteReplacement(FILTERED));
+        if (keyValue == null) {
+            return withoutBearer;   // an honoured empty denylist: no key rule, the absolutes still run
+        }
 
         Matcher matcher = keyValue.matcher(withoutBearer);
         StringBuilder out = new StringBuilder();

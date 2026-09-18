@@ -2,9 +2,15 @@ package tech.anvilcoder.feed;
 
 import org.junit.jupiter.api.Test;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -21,33 +27,44 @@ class AnvilFeedConfigTest {
     }
 
     /**
-     * C17: identical names, identical values in both languages. The table below is the one in the PHP
-     * SDK's {@code Config} and in the report's option table; Task 9 replaces it with a comparison against
-     * {@code conformance/config-defaults.json}, which is a shared file and not this task's to create.
+     * C17's Prüfkriterium is that there is exactly ONE table. It lives in
+     * {@code conformance/config-defaults.json} and both SDKs are compared against it, key by key, so a
+     * default that drifts in one language fails here rather than in a customer's cockpit (review
+     * finding 8). The file is read from the repository root through the property the build wires up —
+     * there is no copy under {@code java/}.
      */
     @Test
-    void everyDefaultIsTheOneBothLanguagesAgreeOn() {
-        AnvilFeedConfig config = usable().build(logger);
+    void everyDefaultIsTheOneBothLanguagesAgreeOn() throws Exception {
+        Path fixture = Path.of(System.getProperty("anvilfeed.conformance")).resolve("config-defaults.json");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> expected =
+                new ObjectMapper().readValue(Files.readString(fixture), LinkedHashMap.class);
+        expected.remove("note");
 
-        assertEquals("https://app.anvil-coder.tech/api/feed", config.endpoint());
-        assertEquals("production", config.environment());
-        assertEquals(1000, config.maxQueueSize());
-        assertEquals(2000, config.flushIntervalMs());
-        assertEquals(50, config.batchSize());
-        assertEquals(1000, config.connectTimeoutMs());
-        assertEquals(2000, config.requestTimeoutMs());
-        assertEquals(50, config.maxFrames());
-        assertEquals(20, config.contextLines());
-        assertEquals(400, config.maxContextLineChars());
-        assertEquals(List.of("password", "token", "secret", "authorization", "api_key", "cookie", "email",
-                "credit_card", "iban"), config.denylist());
-        assertEquals(10, config.fingerprintCap());
-        assertEquals(60_000, config.fingerprintWindowMs());
-        assertEquals(List.of("/api/feed/**"), config.ignoredRequestPaths());
-        assertTrue(config.enabled());
+        AnvilFeedConfig config = usable().build(logger);
+        Map<String, Object> actual = new LinkedHashMap<>();
+        actual.put("endpoint", config.endpoint());
+        actual.put("environment", config.environment());
+        actual.put("max_queue_size", config.maxQueueSize());
+        actual.put("flush_interval_ms", config.flushIntervalMs());
+        actual.put("batch_size", config.batchSize());
+        actual.put("connect_timeout_ms", config.connectTimeoutMs());
+        actual.put("request_timeout_ms", config.requestTimeoutMs());
+        actual.put("max_frames", config.maxFrames());
+        actual.put("context_lines", config.contextLines());
+        actual.put("max_context_line_chars", config.maxContextLineChars());
+        actual.put("denylist", config.denylist());
+        actual.put("fingerprint_cap", config.fingerprintCap());
+        actual.put("fingerprint_window_ms", config.fingerprintWindowMs());
+        actual.put("ignored_request_paths", config.ignoredRequestPaths());
+
+        assertEquals(expected, actual);
+        // A key the fixture grows and this test does not know about is a drift too.
+        assertEquals(expected.keySet(), actual.keySet());
         // token, service and release have NO default. A token that defaults to anything is a token
         // somebody ships.
         assertEquals(null, config.release());
+        assertTrue(config.enabled());
     }
 
     @Test
@@ -134,18 +151,54 @@ class AnvilFeedConfigTest {
 
         assertFalse(config.enabled());
         assertEquals("https://app.anvil-coder.tech/api/feed", config.endpoint());
-        assertEquals(AnvilFeedConfig.DEFAULT_DENYLIST, config.denylist());
+        // A list of nothing but nulls and blanks IS an empty list, and an empty list is honoured.
+        assertEquals(List.of(), config.denylist());
         assertEquals(List.of("x"), config.ignoredRequestPaths());
         assertEquals("production", config.environment());
     }
 
-    /** An empty denylist is a PII hole, so it is refused; "ignore no request path" is a real intent. */
+    /**
+     * PHP's {@code listOption} honours an explicit empty list and so does this (review finding 7) — but
+     * switching FR-5's key rule off is not something anybody may discover from a cockpit full of secrets,
+     * so it is said once.
+     */
     @Test
-    void anEmptyDenylistIsRefusedAndAnEmptyIgnoreListIsHonoured() {
+    void anEmptyDenylistIsHonouredAndAnnounced() {
         AnvilFeedConfig config = usable().denylist(List.of()).ignoredRequestPaths(List.of()).build(logger);
 
-        assertEquals(AnvilFeedConfig.DEFAULT_DENYLIST, config.denylist());
+        assertEquals(List.of(), config.denylist());
         assertEquals(List.of(), config.ignoredRequestPaths());
+        assertThat(said).singleElement().asString()
+                .contains("the denylist is empty").contains("Bearer tokens");
+    }
+
+    /** null is "not configured" and is not the same statement as an empty list. */
+    @Test
+    void aNullDenylistKeepsTheDefaultAndSaysNothing() {
+        AnvilFeedConfig config = usable().denylist(null).build(logger);
+
+        assertEquals(AnvilFeedConfig.DEFAULT_DENYLIST, config.denylist());
+        assertThat(said).isEmpty();
+    }
+
+    /**
+     * {@code connect_timeout_ms = 0} reads to an operator like "no timeout" and is an
+     * IllegalArgumentException out of {@code HttpClient.Builder.connectTimeout} on the first send;
+     * a zero flush interval is a busy loop (review finding 11).
+     */
+    @Test
+    void theKnobsTaskSevenWouldChokeOnAreClampedTooAndSaidOnce() {
+        AnvilFeedConfig config = usable()
+                .flushIntervalMs(0).connectTimeoutMs(0).requestTimeoutMs(-1)
+                .fingerprintCap(-5).fingerprintWindowMs(-1)
+                .build(logger);
+
+        assertEquals(1, config.flushIntervalMs());
+        assertEquals(1, config.connectTimeoutMs());
+        assertEquals(1, config.requestTimeoutMs());
+        assertEquals(0, config.fingerprintCap());
+        assertEquals(0, config.fingerprintWindowMs());
+        assertThat(said).hasSize(5);
     }
 
     @Test

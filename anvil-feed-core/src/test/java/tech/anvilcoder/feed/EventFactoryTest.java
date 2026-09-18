@@ -1,8 +1,11 @@
 package tech.anvilcoder.feed;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import shop.CheckoutService;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -12,6 +15,8 @@ import java.util.stream.IntStream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EventFactoryTest {
@@ -256,5 +261,259 @@ class EventFactoryTest {
             text.append("token=y;");
         }
         return text.substring(0, length);
+    }
+    // ----- Review finding 1: finalise() is run twice on every hooked event ------------------------------
+
+    /**
+     * {@code finalise(finalise(p)) == finalise(p)}, through the real factory, with a quoted secret in the
+     * message, in a tag and in a breadcrumb — the three places a config line lands. Before the scrubber's
+     * quote group moved in front of its two lookaheads, every one of them gained {@code ]"} per pass.
+     */
+    @Test
+    void finalisingAnAlreadyFinalisedPayloadChangesNothing() {
+        EventFactory factory = factory("production");
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("breadcrumbs", new ArrayList<>(List.of("config: secret='hunter2' loaded")));
+        context.put("tags", new LinkedHashMap<>(Map.of("note", "password=\"hunter2\"")));
+        Map<String, Object> once = factory
+                .fromThrowable(new IllegalStateException("cfg token=\"abc123\" failed"), "error", context)
+                .payload();
+
+        Map<String, Object> twice = factory.finalise(new LinkedHashMap<>(once));
+
+        assertEquals(once, twice, "a second pass over an already finalised payload changed it");
+        assertEquals("java.lang.IllegalStateException: cfg token=\"[Filtered]\" failed", once.get("title"));
+        assertEquals("config: secret='[Filtered]' loaded", ((List<?>) once.get("breadcrumbs")).get(0));
+        assertEquals("password=\"[Filtered]\"", map(once.get("tags")).get("note"));
+    }
+
+    // ----- Review finding 3: the second pass has to re-count, not only re-clip -------------------------
+
+    /**
+     * Enrichment is the single most obvious use of a {@code beforeSend} hook, and a thirtieth tag on a full
+     * event costs the whole event: schema 1.0 sets {@code maxProperties: 29}. Each number here is exactly
+     * one over its cap, and the directions are asserted with it.
+     */
+    @Test
+    void finaliseReAppliesEveryCountCapABeforeSendHookCanBreak() {
+        EventFactory factory = factory("production");
+        Map<String, Object> payload =
+                new LinkedHashMap<>(factory.fromThrowable(CheckoutService.charge(), "error", Map.of()).payload());
+
+        Map<String, Object> tags = new LinkedHashMap<>();
+        IntStream.rangeClosed(1, 30).forEach(i -> tags.put("tag-" + i, "v" + i));
+        payload.put("tags", tags);
+        payload.put("breadcrumbs", IntStream.rangeClosed(1, 31).mapToObj(i -> "step " + i).toList());
+        Map<String, Object> exception = new LinkedHashMap<>(map(payload.get("exception")));
+        exception.put("stacktrace", IntStream.rangeClosed(1, 51)
+                .mapToObj(i -> (Object) new LinkedHashMap<>(Map.of("file", "Frame" + i + ".java",
+                        "line", i, "function", "f", "in_app", Boolean.TRUE)))
+                .toList());
+        payload.put("exception", exception);
+
+        Map<String, Object> finalised = factory.finalise(payload);
+
+        assertEquals(29, map(finalised.get("tags")).size(), "schema 1.0 allows 29 tags; the 30th costs the event");
+        assertTrue(map(finalised.get("tags")).containsKey("tag-1"));
+        assertFalse(map(finalised.get("tags")).containsKey("tag-30"));
+        List<?> crumbs = (List<?>) finalised.get("breadcrumbs");
+        assertEquals(30, crumbs.size());
+        assertEquals("step 2", crumbs.get(0), "the TAIL explains the fault, so the front is what goes");
+        assertEquals("step 31", crumbs.get(29));
+        List<?> frames = (List<?>) map(finalised.get("exception")).get("stacktrace");
+        assertEquals(50, frames.size());
+        assertEquals("Frame1.java", map(frames.get(0)).get("file"), "frame 0 is the crash site and stays");
+    }
+
+    // ----- Review finding 2: request.status_code is an integer on the wire -----------------------------
+
+    @Test
+    void aStatusCodeThatTookAStringHopIsStillAnIntegerOnTheWire() {
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("request", new LinkedHashMap<>(Map.of(
+                "method", "GET", "url", "https://a.example/x", "status_code", "500")));
+
+        Map<String, Object> request = map(factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", context).payload().get("request"));
+
+        assertEquals(500, request.get("status_code"));
+        assertEquals(Integer.class, request.get("status_code").getClass());
+    }
+
+    @Test
+    void aStatusCodeThatIsNotANumberIsDroppedRatherThanShippedAsAViolation() {
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("request", new LinkedHashMap<>(Map.of(
+                "method", "GET", "url", "https://a.example/x", "status_code", "not a status")));
+
+        Map<String, Object> request = map(factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", context).payload().get("request"));
+
+        assertFalse(request.containsKey("status_code"));
+        assertEquals("https://a.example/x", request.get("url"), "the rest of the block survives");
+    }
+
+    // ----- Review findings 4 and 6: what a host object becomes ----------------------------------------
+
+    /** PHP's {@code json_encode} fallback, and not Java's {@code toString} — {@code {a=1}} parses nowhere. */
+    @Test
+    void aNonScalarTagOrBreadcrumbTravelsAsItsJsonNotAsItsToString() {
+        Map<String, Object> context = new LinkedHashMap<>();
+        context.put("tags", new LinkedHashMap<>(Map.of("k", Map.of("a", 1))));
+        context.put("breadcrumbs", new ArrayList<>(List.of(Map.of("b", 2))));
+
+        Map<String, Object> payload = factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", context).payload();
+
+        assertEquals("{\"a\":1}", map(payload.get("tags")).get("k"));
+        assertEquals("{\"b\":2}", ((List<?>) payload.get("breadcrumbs")).get(0));
+    }
+
+    /**
+     * A hook that writes a host's own object into a tag used to reach a bare {@code ObjectMapper}, which
+     * serialises an unknown type reflectively — every field of it on the wire, none of them ever seen by
+     * the denylist, because the scrubber descends only into Map, List and String.
+     */
+    @Test
+    void aHostObjectBecomesTextBeforeJacksonEverSeesIt() {
+        EventFactory factory = factory("production");
+        Map<String, Object> payload =
+                new LinkedHashMap<>(factory.fromThrowable(CheckoutService.charge(), "error", Map.of()).payload());
+        payload.put("tags", new LinkedHashMap<>(Map.of("order", new Order("o-1", "sk-live-99887766"))));
+
+        Map<String, Object> finalised = factory.finalise(payload);
+
+        Object tag = map(finalised.get("tags")).get("order");
+        assertThat(tag).isInstanceOf(String.class);
+        assertThat((String) tag).isEqualTo("Order[id=o-1, apiKey=[Filtered]]");
+        assertThat(new FeedEvent("x", finalised).canonicalJson()).doesNotContain("sk-live-99887766");
+    }
+
+    /** FR-2 b names serialisation: a payload that cannot be written loses its event, not the host thread. */
+    @Test
+    void canonicalJsonAnswersNullRatherThanThrowingIntoTheHost() {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("schema_version", "1.0");
+        payload.put("unserialisable", new Order("o-1", "s"));
+
+        assertNull(new FeedEvent("e-1", payload).canonicalJson());
+    }
+
+    /** A host that kept the map it was handed cannot edit an event a sender thread is serialising. */
+    @Test
+    void theEventPayloadIsNotAWindowIntoTheEvent() {
+        Map<String, Object> payload = factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+
+        assertThrows(UnsupportedOperationException.class, () -> payload.put("level", "info"));
+    }
+
+    // ----- Review finding 5: the in-app rule is structural --------------------------------------------
+
+    @Test
+    void theInAppRuleIsAPathSegmentAndNotASubstring() {
+        assertFalse(EventFactory.isInApp("/app/vendor/acme/lib/Client.php"));
+        assertFalse(EventFactory.isInApp("C:\\app\\vendor\\acme\\Client.java"), "the same on Windows");
+        assertFalse(EventFactory.isInApp("/app/node_modules/x/index.js"));
+        assertTrue(EventFactory.isInApp("/app/vendorish/Client.java"), "a path segment, not a substring");
+        assertFalse(EventFactory.isInApp("tech.anvilcoder.feed.EventFactory"), "this SDK is never in app");
+        assertFalse(EventFactory.isInApp("/src/main/java/tech/anvilcoder/feed/Scrubber.java"));
+        assertTrue(EventFactory.isInApp("shop.CheckoutService"));
+        assertFalse(EventFactory.isInApp(null));
+        assertFalse(EventFactory.isInApp("  "));
+    }
+
+    // ----- Review finding 10: one number -------------------------------------------------------------
+
+    @Test
+    void theWireVersionIsThePublishedVersion() {
+        assertEquals(System.getProperty("anvilfeed.version"), EventFactory.SDK_VERSION,
+                "sdk.version and the Maven coordinate both come from gradle/libs.versions.toml");
+    }
+
+    // ----- Review finding 12: the public API is not null-hostile ---------------------------------------
+
+    @Test
+    void nothingACallerPassesTurnsIntoTheHostsSecondFailure() {
+        EventFactory factory = factory("production");
+
+        Map<String, Object> fromNullThrowable = factory.fromThrowable(null, "error", null).payload();
+        assertEquals(EventFactory.MESSAGE_TYPE, map(fromNullThrowable.get("exception")).get("type"));
+        assertThat((String) fromNullThrowable.get("title")).contains("without an exception");
+
+        assertThat(factory.fromThrowable(CheckoutService.charge(), "error", null).payload()).isNotEmpty();
+        assertThat(factory.fromMessage(null, null, null).payload().get("level")).isEqualTo("error");
+    }
+
+    /** A wiring mistake fails where the host can see it, not inside somebody else's incident. */
+    @Test
+    void aMisWiredFactoryFailsAtConstruction() {
+        assertThrows(NullPointerException.class,
+            () -> new EventFactory(null, new Scrubber(AnvilFeedConfig.DEFAULT_DENYLIST), GitContext.none()));
+    }
+
+    // ----- Review finding 15: context_code, where there is a source to read ----------------------------
+
+    /**
+     * A deployed jar has no sources and every frame answers null; a checkout has them, and an operator who
+     * raises {@code context_lines} must see the effect the configuration reference promises. The test runs
+     * from the module directory, so {@code src/test/java} is the root that is found.
+     */
+    @Test
+    void contextCodeIsFilledForInAppFramesWhereASourceRootExists() {
+        Assumptions.assumeTrue(Files.isDirectory(Path.of("src/test/java")),
+                "no source root under the working directory — the deployed-jar case, covered below");
+
+        Map<String, Object> payload = factory("production")
+                .fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+
+        List<Map<String, Object>> frames = frames(payload);
+        assertThat((String) frames.get(0).get("context_code")).contains("Cart.total()");
+        assertThat(frames).filteredOn(frame -> Boolean.FALSE.equals(frame.get("in_app")))
+                .allSatisfy(frame -> assertFalse(frame.containsKey("context_code"),
+                        "a dependency's source lines cost a file read and tell a repair agent nothing"));
+    }
+
+    @Test
+    void contextLinesZeroSwitchesTheSourceLookupOffEntirely() {
+        AnvilFeedConfig config = AnvilFeedConfig.builder()
+                .token("anv_srv_x").service("shop-api").contextLines(0).build(FeedLogger.toSystemLogger());
+        EventFactory factory =
+                new EventFactory(config, new Scrubber(AnvilFeedConfig.DEFAULT_DENYLIST), GitContext.none());
+
+        Map<String, Object> payload = factory.fromThrowable(CheckoutService.charge(), "error", Map.of()).payload();
+
+        assertThat(frames(payload)).allSatisfy(frame -> assertFalse(frame.containsKey("context_code")));
+    }
+
+    /**
+     * A host's own type — a plain bean with getters, which is what an entity in a {@code tags} map is.
+     * Jackson's default mapper would have written {@code {"id":"o-1","apiKey":"sk-live-…"}} for it,
+     * reflectively and without the scrubber ever seeing the field; {@link Json} has auto-detection off,
+     * so it has no properties, no serialiser, and {@link EventFactory#finalise} turns it into text that
+     * the scrubber CAN read.
+     */
+    private static final class Order {
+
+        private final String id;
+        private final String apiKey;
+
+        Order(String id, String apiKey) {
+            this.id = id;
+            this.apiKey = apiKey;
+        }
+
+        public String getId() {
+            return id;
+        }
+
+        public String getApiKey() {
+            return apiKey;
+        }
+
+        @Override
+        public String toString() {
+            return "Order[id=" + id + ", apiKey=" + apiKey + "]";
+        }
     }
 }

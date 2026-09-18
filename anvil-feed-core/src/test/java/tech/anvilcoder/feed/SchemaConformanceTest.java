@@ -63,8 +63,12 @@ class SchemaConformanceTest {
     /** A rich context: every optional block the factory knows how to fill. */
     private static Map<String, Object> fullContext() {
         Map<String, Object> context = new LinkedHashMap<>();
+        // "500" as a STRING on purpose (review finding 2): a filter reading the status off a header, or a
+        // value that took a properties or JSON hop, hands over exactly this — and an event carrying a
+        // string here is answered schema_violation and lost.
         context.put("request", new LinkedHashMap<>(Map.of(
-                "method", "POST", "url", "https://shop.example/api/checkout?token=abc123", "status_code", 500)));
+                "method", "POST", "url", "https://shop.example/api/checkout?token=abc123",
+                "status_code", "500")));
         context.put("user_id", "u-4711");
         context.put("breadcrumbs", new ArrayList<>(List.of("cart.add sku=A1", "checkout.start")));
         context.put("tags", new LinkedHashMap<>(Map.of("tier", "gold")));
@@ -149,5 +153,29 @@ class SchemaConformanceTest {
         assertThat(json).startsWith("{\"schema_version\":\"1.0\",\"event_id\":\"" + event.id() + "\",\"timestamp\":");
         assertThat(json).contains("\"url\":\"https://shop.example/api/checkout?token=[Filtered]\"");
         assertThat(json).doesNotContain("\\/");
+    }
+    /**
+     * The hostile shape a {@code beforeSend} hook produces: one more tag than the schema allows, one more
+     * breadcrumb, one more frame. Judged by the schema itself, because that is what the ingest applies
+     * (review finding 3).
+     */
+    @Test
+    void aHookThatOverfillsEveryBlockStillProducesAValidEvent() throws Exception {
+        JsonSchema schema = schema();
+        EventFactory factory = factory();
+        Map<String, Object> payload = new LinkedHashMap<>(
+                factory.fromThrowable(CheckoutService.charge(), "error", fullContext()).payload());
+
+        Map<String, Object> tags = new LinkedHashMap<>();
+        IntStream.rangeClosed(1, 30).forEach(i -> tags.put("tag-" + i, "v" + i));
+        payload.put("tags", tags);
+        payload.put("breadcrumbs", IntStream.rangeClosed(1, 31).mapToObj(i -> "step " + i).toList());
+
+        FeedEvent event = new FeedEvent(payload.get("event_id").toString(),
+                FeedEvent.inCanonicalOrder(factory.finalise(payload)));
+
+        assertThat(errors(schema, event)).as("%s", event.canonicalJson()).isEmpty();
+        assertThat(map(event.payload().get("tags"))).hasSize(29);
+        assertThat((List<?>) event.payload().get("breadcrumbs")).hasSize(30);
     }
 }

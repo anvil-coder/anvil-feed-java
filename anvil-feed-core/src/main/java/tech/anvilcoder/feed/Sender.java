@@ -220,9 +220,13 @@ public final class Sender implements AutoCloseable {
 
     /**
      * Serialises the batch, dropping the events that cannot be encoded. {@code FeedEvent.canonicalJson()}
-     * throws on a payload holding something Jackson has no serialiser for — a host's own object placed
-     * there by a context map or a beforeSend hook — and one such event must not cost the forty-nine
-     * beside it, nor sit at the head of a bounded queue for ever.
+     * answers {@code null} for a payload holding something Jackson has no serialiser for — a host's own
+     * object placed there by a context map or a beforeSend hook — and one such event must not cost the
+     * forty-nine beside it, nor sit at the head of a bounded queue for ever.
+     *
+     * <p>It no longer throws (task-6 review finding 4), and the {@code catch} below stays anyway: this
+     * method is the last thing between a payload and the socket, and it is cheaper to keep the belt than
+     * to rediscover which of the two contracts held.
      *
      * @param encodable filled with the events that survived, in order
      */
@@ -230,7 +234,13 @@ public final class Sender implements AutoCloseable {
         List<String> parts = new ArrayList<>(batch.size());
         for (FeedEvent event : batch) {
             try {
-                parts.add(event.canonicalJson());
+                String json = event.canonicalJson();
+                if (json == null) {
+                    logger.warning("anvil-feed: dropping event " + event.id()
+                            + " — it cannot be encoded as JSON.");
+                    continue;
+                }
+                parts.add(json);
                 encodable.add(event);
             } catch (RuntimeException unencodable) {
                 logger.warning("anvil-feed: dropping event " + event.id()

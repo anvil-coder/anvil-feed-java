@@ -2,6 +2,8 @@
 # numbers is spelled a second time anywhere under java/.
 [versions]
 java = "25"
+# The SDK's own version: the Maven coordinate AND sdk.version on the wire are both derived from it.
+sdkVersion = "0.1.0"
 springBoot = "4.0.0"
 jackson = "2.18.2"
 junit = "5.11.4"

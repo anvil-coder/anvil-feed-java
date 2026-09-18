@@ -15,6 +15,9 @@ import java.util.regex.Pattern;
  * service, an unrepairable environment — switch {@link #enabled()} off rather than letting the SDK send
  * events the ingest will answer {@code schema_violation} to.
  *
+ * <p>Immutable and safe to share across threads: every component is a primitive, a String or an
+ * unmodifiable list.
+ *
  * <p><b>Check {@link #enabled()}, never the token.</b> {@code enabled} is forced false by four
  * independent things and in three of them the token is present.
  */
@@ -118,6 +121,7 @@ public record AnvilFeedConfig(
         private int fingerprintCap = 10;
         private int fingerprintWindowMs = 60_000;
         private List<String> ignoredRequestPaths = List.of("/api/feed/**");
+        private boolean denylistCleared;
 
         public Builder endpoint(String value) { if (present(value)) { this.endpoint = value.trim(); } return this; }
         public Builder token(String value) { if (present(value)) { this.token = value.trim(); } return this; }
@@ -132,11 +136,15 @@ public record AnvilFeedConfig(
         public Builder maxFrames(int value) { this.maxFrames = value; return this; }
         public Builder contextLines(int value) { this.contextLines = value; return this; }
         public Builder maxContextLineChars(int value) { this.maxContextLineChars = value; return this; }
-        /** An empty denylist is refused and the default kept: FR-5 a is not a knob a typo may switch off. */
+        /**
+         * An EMPTY list is honoured, as PHP's {@code listOption} honours it (review finding 7) — but it is
+         * announced, because switching FR-5's key rule off is not something anybody should discover from
+         * a cockpit full of secrets. {@code null} still means "not configured" and keeps the default.
+         */
         public Builder denylist(List<String> value) {
-            List<String> kept = strings(value);
-            if (!kept.isEmpty()) {
-                this.denylist = kept;
+            if (value != null) {
+                this.denylist = strings(value);
+                this.denylistCleared = this.denylist.isEmpty();
             }
             return this;
         }
@@ -171,6 +179,11 @@ public record AnvilFeedConfig(
                 log.once("token", "anvil-feed: no ingest token (ANVIL_INGEST_TOKEN); the SDK is disabled.");
                 on = false;
             }
+            if (denylistCleared) {
+                log.once("denylist", "anvil-feed: the denylist is empty, so no value is filtered by its key "
+                        + "any more. Bearer tokens, URL credentials and user.ip are still removed — nothing "
+                        + "else is. Remove the setting to get the nine default terms back.");
+            }
             String normalized = normalizeEnvironment(environment, log);
             if (normalized == null) {
                 on = false;
@@ -180,11 +193,17 @@ public record AnvilFeedConfig(
                     trimTrailingSlash(endpoint), token, name,
                     normalized == null ? "production" : normalized, release,
                     atLeastOne(maxQueueSize, "max_queue_size", log),
-                    flushIntervalMs, Math.min(50, Math.max(1, batchSize)),
-                    connectTimeoutMs, requestTimeoutMs,
+                    atLeastOne(flushIntervalMs, "flush_interval_ms", log),
+                    Math.min(50, Math.max(1, batchSize)),
+                    // java.net.http.HttpClient refuses a non-positive connect timeout and HttpRequest
+                    // refuses a non-positive request timeout, both with an IllegalArgumentException on the
+                    // first send — and "0" reads to an operator like "no timeout" (review finding 11).
+                    atLeastOne(connectTimeoutMs, "connect_timeout_ms", log),
+                    atLeastOne(requestTimeoutMs, "request_timeout_ms", log),
                     Math.min(50, Math.max(1, maxFrames)), Math.min(20, Math.max(0, contextLines)),
                     Math.min(400, Math.max(1, maxContextLineChars)),
-                    denylist, on, fingerprintCap, fingerprintWindowMs, ignoredRequestPaths);
+                    denylist, on, atLeastZero(fingerprintCap, "fingerprint_cap", log),
+                    atLeastZero(fingerprintWindowMs, "fingerprint_window_ms", log), ignoredRequestPaths);
         }
 
         /**
@@ -225,6 +244,15 @@ public record AnvilFeedConfig(
             logger.once("clamp:" + key, "anvil-feed: \"" + key + "\" is " + value + "; 1 is used instead — a "
                     + "bound below one would drop every event and write a warning about each.");
             return 1;
+        }
+
+        /** A negative cap or window is not a smaller one, it is an undefined one. */
+        private static int atLeastZero(int value, String key, FeedLogger logger) {
+            if (value >= 0) {
+                return value;
+            }
+            logger.once("clamp:" + key, "anvil-feed: \"" + key + "\" is " + value + "; 0 is used instead.");
+            return 0;
         }
 
         /** A list handed in by a host framework may hold nulls and blanks; neither may reach a regex. */

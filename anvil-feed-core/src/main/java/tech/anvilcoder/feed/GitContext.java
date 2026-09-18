@@ -12,10 +12,22 @@ import java.util.regex.Pattern;
  * <p>FR-6 b: filled where determinable, left out where not. FR-6 c: no {@code unknown}, no empty string.
  * A subprocess would need a git binary on a production image that may have none, and a fork in a path
  * Z4 budgets one millisecond for. Three small files answer the same question.
+ *
+ * <p><b>Call {@link #discover(Path)} ONCE, at startup, and hold the result.</b> It does up to twelve
+ * {@code isDirectory} probes and three file reads; on the capture path, which Z4 budgets a millisecond
+ * for, that is filesystem I/O per event for an answer that cannot change while the process runs.
+ *
+ * <p>Immutable and safe to share across threads.
  */
 public final class GitContext {
 
-    private static final Pattern SHA = Pattern.compile("[0-9a-f]{40}");
+    /**
+     * An object name: 40 hex characters in a SHA-1 repository, 64 in one created with
+     * {@code --object-format=sha256} (review finding 13). Matching only the first would leave
+     * {@code release} null on a detached HEAD there — correct behaviour, since nothing is ever guessed,
+     * but a silently narrower answer than the operator expects.
+     */
+    private static final Pattern SHA = Pattern.compile("[0-9a-f]{40}|[0-9a-f]{64}");
     private static final Pattern ORIGIN_URL =
             Pattern.compile("\\[remote \"origin\"][^\\[]*url\\s*=\\s*(\\S+)", Pattern.DOTALL);
     private static final Pattern OWNER_NAME = Pattern.compile("[:/]([^/:]+/[^/]+)$");
@@ -69,6 +81,8 @@ public final class GitContext {
         } else if (SHA.matcher(head).matches()) {
             release = head;   // a detached HEAD, which is what a CI checkout normally is
         }
+        // Anything else — a HEAD this version cannot read — leaves release null. FR-6 c: omitted, never
+        // guessed, and never "unknown".
         return new GitContext(release, originRepo(gitDir), branch);
     }
 
@@ -97,8 +111,11 @@ public final class GitContext {
         }
         for (String line : packed.split("\n")) {
             String trimmed = line.trim();
-            if (trimmed.endsWith(" " + ref) && trimmed.length() > 40) {
-                return trimmed.substring(0, 40);
+            if (trimmed.endsWith(" " + ref)) {
+                String name = trimmed.substring(0, trimmed.indexOf(' ') < 0 ? 0 : trimmed.indexOf(' '));
+                if (SHA.matcher(name).matches()) {
+                    return name;
+                }
             }
         }
         return null;

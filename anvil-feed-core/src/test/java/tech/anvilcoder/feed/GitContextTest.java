@@ -69,13 +69,39 @@ class GitContextTest {
         assertThat(context.branch()).isNull();
     }
 
+    /**
+     * Hermetic (review finding 17). The earlier version handed a {@code @TempDir} to {@code discover} and
+     * relied on the machine's temp directory not living inside a checkout — true on a developer's laptop,
+     * false on CI images that redirect {@code java.io.tmpdir} under the workspace, and then it failed for
+     * a reason that has nothing to do with the rule. A {@code .git} directory that exists and holds
+     * nothing readable proves the same thing and depends on nothing.
+     */
     @Test
-    void nothingIsInventedWhereThereIsNoGit(@TempDir Path root) {
+    void nothingIsInventedWhereThereIsNothingToRead(@TempDir Path root) throws IOException {
+        Files.createDirectories(root.resolve(".git"));   // present, and empty: no HEAD, no config
+
         for (GitContext context : new GitContext[] {GitContext.discover(root), GitContext.none(),
                 GitContext.discover(null)}) {
             assertThat(context.release()).isNull();
             assertThat(context.repo()).isNull();
             assertThat(context.branch()).isNull();
         }
+    }
+
+    /** A repository created with {@code --object-format=sha256} names its objects in 64 hex characters. */
+    @Test
+    void aSha256DetachedHeadIsARelease(@TempDir Path root) throws IOException {
+        String sha256 = "b".repeat(64);
+        git(root, sha256, null);
+
+        assertThat(GitContext.discover(root).release()).isEqualTo(sha256);
+    }
+
+    /** What is not an object name is left out, never guessed (FR-6 c). */
+    @Test
+    void aHeadThisVersionCannotReadLeavesTheReleaseOut(@TempDir Path root) throws IOException {
+        git(root, "not-a-sha", null);
+
+        assertThat(GitContext.discover(root).release()).isNull();
     }
 }
