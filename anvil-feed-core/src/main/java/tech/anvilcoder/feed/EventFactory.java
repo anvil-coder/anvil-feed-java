@@ -450,6 +450,16 @@ public final class EventFactory {
      * operator reads three of OUR frames before their own, and {@link #isInApp} decides the promotion the
      * fingerprint partitions on — so those constant frames would collapse every {@code captureMessage()}
      * of an application into a single incident.
+     *
+     * <p><b>What it costs, and where.</b> {@code getStackTrace()} materialises EVERY frame — in a Spring
+     * request routinely 80 to 150 {@link StackTraceElement}s — to keep at most {@code max_frames}, and
+     * task 8's ruling (message and test events carry the caller's frames) puts that on every
+     * {@code captureMessage} and {@code captureTestEvent}, on the path Z4 bounds at p99 under one
+     * millisecond. {@code captureException} does not pay it: a Throwable already carries its own stack.
+     * {@code StackWalker.getInstance().walk(s -> s.dropWhile(...).limit(max_frames)...)} does the same job
+     * without the tail and is the change to make if a measurement ever says this matters; it is not made
+     * here because it is a rewrite of a Task 6 method that no measurement has asked for
+     * (task-8 review finding 7).
      */
     private List<Map<String, Object>> callerFrames() {
         StackTraceElement[] stack = new Throwable().getStackTrace();

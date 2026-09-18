@@ -90,6 +90,19 @@ public final class Sender implements AutoCloseable {
     private final LongSupplier clockMillis;
 
     /**
+     * Task-8 review finding 1. The re-entrancy flag is raised HERE and nowhere else, because this is the
+     * one method every flush funnels through — {@link #flush()}, {@link #flushWithin(long)}, the daemon
+     * {@link #pump()}, the shutdown hook and {@link #close()} all end up in {@link #flush(long)}. It used
+     * to be raised by the CLIENT around its own {@code flush()}, which meant it was raised on the one
+     * thread that rarely sends and never on the two that do: once a host calls {@code start()}, every
+     * post leaves on the daemon pump, where the flag was false for the whole flush. A {@link Transport}
+     * or a host logging appender that captured from its own error branch was then captured, queued and
+     * posted to the endpoint that had just failed — the first turn of the loop, and a silent one, because
+     * {@link #pump()} absorbs whatever it raises.
+     */
+    private final LoopGuard loopGuard;
+
+    /**
      * "Once per process" (ruling P3) lives HERE and not in {@link FeedLogger}: {@code FeedLogger.once()}
      * is per instance, so a host that news up a second logger — a Spring provider binding one per bean is
      * the obvious way — would get every "said once" line twice, and the symptom is a repeated paragraph
@@ -142,11 +155,24 @@ public final class Sender implements AutoCloseable {
      */
     public Sender(AnvilFeedConfig config, EventQueue queue, Transport transport, FeedLogger logger,
                   LongSupplier clockMillis) {
+        this(config, queue, transport, logger, clockMillis, null);
+    }
+
+    /**
+     * @param loopGuard the guard whose re-entrancy flag {@link #flush(long)} raises for the duration of
+     *                  every flush, on whichever thread the flush runs on. Hand over the SAME instance
+     *                  the client checks in its capture path, or the defence is not wired to anything.
+     *                  {@code null} gives this sender a private one, which is right for a
+     *                  {@code Sender} constructed on its own in a test and wrong in production.
+     */
+    public Sender(AnvilFeedConfig config, EventQueue queue, Transport transport, FeedLogger logger,
+                  LongSupplier clockMillis, LoopGuard loopGuard) {
         this.config = config;
         this.queue = queue;
         this.transport = transport;
         this.logger = logger == null ? FeedLogger.toSystemLogger() : logger;
         this.clockMillis = clockMillis == null ? System::currentTimeMillis : clockMillis;
+        this.loopGuard = loopGuard == null ? new LoopGuard(List.of()) : loopGuard;
     }
 
     /** True after a 401, for the lifetime of the process. */
@@ -194,7 +220,20 @@ public final class Sender implements AutoCloseable {
         if (!config.enabled()) {
             return true;
         }
+        // Nothing captured on this thread from here to the finally below is ever queued. This is the ONE
+        // place it is raised (see the field); a caller cannot forget it and a second, nested flush on the
+        // same thread is a no-op rather than a deadlock or a double drain.
+        if (!loopGuard.enterSend()) {
+            return true;
+        }
+        try {
+            return drain(deadlineMillis);
+        } finally {
+            loopGuard.leaveSend();
+        }
+    }
 
+    private boolean drain(long deadlineMillis) {
         boolean acquired;
         try {
             acquired = flushLock.tryLock(Math.max(0L, deadlineMillis - clockMillis.getAsLong()),

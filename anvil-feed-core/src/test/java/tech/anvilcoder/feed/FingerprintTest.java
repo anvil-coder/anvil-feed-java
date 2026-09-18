@@ -158,13 +158,31 @@ class FingerprintTest {
             for (int i = 0; i < frameCount; i++) {
                 String file = randomFile(random);
                 String function = randomText(random);
-                Boolean inApp = random.nextBoolean() ? Boolean.TRUE : Boolean.FALSE;
+                // TRUE, FALSE, absent and a value that is not a Boolean at all. Both sides read
+                // `Boolean.TRUE.equals(...)`, so all three of the last ones mean "not the customer's
+                // code" — and that equivalence is a branch a future edit to either side could split,
+                // which is what this comparison exists to catch (review finding 6).
+                Boolean inApp = switch (random.nextInt(4)) {
+                    case 0 -> Boolean.TRUE;
+                    case 1 -> Boolean.FALSE;
+                    default -> null;
+                };
                 Map<String, Object> frame = new LinkedHashMap<>();
-                frame.put("file", file);
-                frame.put("function", function);
-                frame.put("in_app", inApp);
+                if (random.nextInt(12) != 0) {   // …and sometimes the key is not there at all
+                    frame.put("file", file);
+                }
+                if (random.nextInt(12) != 0) {
+                    frame.put("function", function);
+                }
+                if (Boolean.TRUE.equals(inApp) || Boolean.FALSE.equals(inApp)) {
+                    frame.put("in_app", inApp);
+                } else if (random.nextBoolean()) {
+                    frame.put("in_app", "true");   // a String, which is not TRUE however it reads
+                }
                 ours.add(frame);
-                theirs.add(new IncidentFingerprint.Frame(file, function, inApp));
+                theirs.add(new IncidentFingerprint.Frame(
+                        frame.containsKey("file") ? file : null,
+                        frame.containsKey("function") ? function : null, inApp));
             }
 
             assertEquals(IncidentFingerprint.payload(service, type, title, theirs),
@@ -199,6 +217,36 @@ class FingerprintTest {
                 "without the promotion both stacks are the framework's three dispatcher frames");
         assertEquals(IncidentFingerprint.of("s", "T", "t", oracle(dispatcherFirst)),
                 Fingerprint.of("s", "T", "t", dispatcherFirst));
+    }
+
+    /**
+     * The two branches the generator used to reach only by accident, asserted directly against the oracle:
+     * an {@code in_app} that is absent, null or not a Boolean is not the customer's code, and a file that
+     * is blank is the empty string rather than a path made of spaces.
+     */
+    @Test
+    void aFrameWithAnOddInAppFlagOrABlankFileAgreesWithTheServerToo() {
+        Map<String, Object> noFlag = new LinkedHashMap<>();
+        noFlag.put("file", "app/Checkout.php");
+        noFlag.put("function", "charge");
+        Map<String, Object> nullFlag = new LinkedHashMap<>(noFlag);
+        nullFlag.put("in_app", null);
+        Map<String, Object> stringFlag = new LinkedHashMap<>(noFlag);
+        stringFlag.put("in_app", "true");
+        Map<String, Object> notInApp = new LinkedHashMap<>(noFlag);
+        notInApp.put("in_app", Boolean.FALSE);
+
+        String expected = IncidentFingerprint.of("s", "T", "t",
+                List.of(new IncidentFingerprint.Frame("app/Checkout.php", "charge", null)));
+        for (Map<String, Object> frame : List.of(noFlag, nullFlag, stringFlag, notInApp)) {
+            assertEquals(expected, Fingerprint.of("s", "T", "t", List.of(frame)), frame.toString());
+        }
+
+        assertEquals("", Fingerprint.normalizeFile("   "));
+        assertEquals(IncidentFingerprint.normalizeFile("   "), Fingerprint.normalizeFile("   "));
+        assertEquals(IncidentFingerprint.of("s", "T", "t",
+                        List.of(new IncidentFingerprint.Frame("   ", "charge", true))),
+                Fingerprint.of("s", "T", "t", List.of(frame("   ", "charge", true))));
     }
 
     /** {@code ofEvent} reads the payload the factory built, which is the normal call site. */
@@ -261,8 +309,17 @@ class FingerprintTest {
     }
 
     private static String randomFile(Random random) {
-        if (random.nextInt(20) == 0) {
-            return null;
+        switch (random.nextInt(20)) {
+            case 0 -> {
+                return null;
+            }
+            case 1 -> {
+                return "";      // blank, which both sides answer with the empty string
+            }
+            case 2 -> {
+                return "   ";   // …and blank-but-not-empty, which is the branch `isBlank()` adds
+            }
+            default -> { /* an ordinary generated path */ }
         }
         StringBuilder file = new StringBuilder();
         switch (random.nextInt(4)) {

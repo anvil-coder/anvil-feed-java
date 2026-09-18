@@ -64,4 +64,11 @@ tasks.test {
     systemProperty("anvilfeed.schema", rootProject.projectDir.parentFile.resolve("schema").absolutePath)
     // Review finding 10: the guard that the generated constant and the published coordinate are one number.
     systemProperty("anvilfeed.version", project.version.toString())
+    // Passed through only when the invoking Gradle was given it. FingerprintOracleFreshnessTest SKIPS
+    // without it (the dark-factory worktree is not on every machine) and FAILS with it if the server's
+    // IncidentFingerprint has moved under the oracle. Task 11's CI job is what sets it.
+    val incidentsWorktree = providers.systemProperty("anvilfeed.incidents.worktree")
+    if (incidentsWorktree.isPresent) {
+        systemProperty("anvilfeed.incidents.worktree", incidentsWorktree.get())
+    }
 }

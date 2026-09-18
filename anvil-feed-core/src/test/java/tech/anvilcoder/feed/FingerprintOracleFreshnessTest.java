@@ -13,7 +13,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.abort;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The oracle can go stale, and nothing else in this repository would notice.
@@ -37,9 +37,12 @@ import static org.junit.jupiter.api.Assumptions.abort;
  *       the frame cap and every path-normalisation pattern are still the server's.</li>
  * </ol>
  *
- * <p>When the worktree is not on this machine the test ABORTS with the path it looked for, rather than
- * passing quietly. Task 11 turns this into a CI diff against the source repository, at which point the
- * abort branch stops being reachable in the run that matters.
+ * <p><b>Skipped or failed, never quietly passed.</b> Without {@code -Danvilfeed.incidents.worktree} the
+ * checkout is simply not on this machine and the test SKIPS, naming the property. WITH the property it is
+ * a hard check: a missing file is a failure and so is a moved digest, because somebody who pointed this at
+ * a checkout asked the question and is owed an answer. Task 11's CI job sets the property, which is what
+ * turns the skip branch into one that never runs where it matters. (Task-8 fix round; the earlier version
+ * aborted on a missing file whether or not anybody had asked for the comparison.)
  */
 class FingerprintOracleFreshnessTest {
 
@@ -47,9 +50,12 @@ class FingerprintOracleFreshnessTest {
      * The dark-factory worktree the copy was taken from. A property so that CI (Task 11) can point it at a
      * checkout of its own without editing this file.
      */
-    private static final Path UPSTREAM = Path.of(System.getProperty("anvilfeed.incidents.worktree",
-            "/tmp/wt-incidents"), "domain/src/main/java/com/darkfactory/domain/service/"
-            + "IncidentFingerprint.java");
+    private static final String WORKTREE_PROPERTY = "anvilfeed.incidents.worktree";
+
+    private static final String WORKTREE = System.getProperty(WORKTREE_PROPERTY);
+
+    private static final Path UPSTREAM = Path.of(WORKTREE == null ? "/tmp/wt-incidents" : WORKTREE,
+            "domain/src/main/java/com/darkfactory/domain/service/IncidentFingerprint.java");
 
     /**
      * The copy, in the test source set, under the server's own package and name so it diffs directly.
@@ -75,11 +81,18 @@ class FingerprintOracleFreshnessTest {
 
     @Test
     void theServersOwnRuleHasNotMovedUnderTheOracle() throws Exception {
-        if (!Files.isReadable(UPSTREAM)) {
-            abort("the dark-factory worktree is not on this machine (" + UPSTREAM + "), so the oracle's "
-                    + "freshness cannot be checked here. Set -Danvilfeed.incidents.worktree=<checkout> to "
-                    + "check it, and see task 11 for the CI job that makes this branch unreachable.");
-        }
+        assumeTrue(WORKTREE != null,
+                "-D" + WORKTREE_PROPERTY + " is not set, so there is no dark-factory checkout on this "
+                        + "machine to compare the oracle against. Set it to a checkout — the file looked "
+                        + "for is <checkout>/domain/src/main/java/com/darkfactory/domain/service/"
+                        + "IncidentFingerprint.java — and this becomes a hard check. Task 11's CI job "
+                        + "sets it; the copy under test is " + COPY + ".");
+
+        assertThat(Files.isReadable(UPSTREAM))
+                .describedAs("-D%s points at %s, but the server's IncidentFingerprint is not readable "
+                        + "there (%s). Point it at a dark-factory checkout, or unset it to skip this "
+                        + "check.", WORKTREE_PROPERTY, WORKTREE, UPSTREAM)
+                .isTrue();
 
         assertThat(Files.isReadable(COPY))
                 .describedAs("the oracle itself is missing from the test source set (%s); "

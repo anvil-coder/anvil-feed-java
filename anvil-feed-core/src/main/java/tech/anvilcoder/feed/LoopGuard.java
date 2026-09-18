@@ -1,5 +1,7 @@
 package tech.anvilcoder.feed;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -68,7 +70,7 @@ public final class LoopGuard {
         if (path == null || path.isEmpty()) {
             return false;
         }
-        String normalized = canonical(cutQuery(withoutOrigin(path)));
+        String normalized = canonical(percentDecoded(cutQuery(withoutOrigin(path))));
         for (Pattern pattern : patterns) {
             if (pattern.matcher(normalized).matches()) {
                 return true;
@@ -145,6 +147,43 @@ public final class LoopGuard {
             resolved.add(segment);
         }
         return "/" + String.join("/", resolved);
+    }
+
+    /**
+     * Percent-decoding, ONCE (review finding 9). A host is expected to hand over the path it actually
+     * routed on, and this is the backstop for the ones that do not: {@code /api/%66eed/events} and
+     * {@code /app/%2e%2e/api/feed/events} both reach a permissive router or a rewrite rule as written,
+     * and a guard that matched them raw would answer "not ignored" and report the ingest's own failure
+     * to the ingest.
+     *
+     * <p>Once and not to a fixed point: decoding repeatedly would turn {@code %2525} into {@code %} and
+     * make a literal path segment somebody really has match a pattern it does not. A sequence that is not
+     * valid percent-encoding is left exactly as it is, because a path is not required to be encoded at
+     * all. Bytes are decoded and then read as UTF-8, which is what a servlet container does; anything
+     * undecodable comes back through the replacement character rather than through an exception, since
+     * this runs on the capture path.
+     */
+    private static String percentDecoded(String path) {
+        if (path.indexOf('%') < 0) {
+            return path;
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(path.length());
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            int high;
+            int low;
+            if (c == '%' && i + 2 < path.length()
+                    && (high = Character.digit(path.charAt(i + 1), 16)) >= 0
+                    && (low = Character.digit(path.charAt(i + 2), 16)) >= 0) {
+                bytes.write((high << 4) + low);
+                i += 2;
+            } else {
+                // Not a percent-escape: write the character's own UTF-8, so a path that was never
+                // encoded survives byte for byte.
+                bytes.writeBytes(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        return bytes.toString(StandardCharsets.UTF_8);
     }
 
     private static String cutQuery(String path) {

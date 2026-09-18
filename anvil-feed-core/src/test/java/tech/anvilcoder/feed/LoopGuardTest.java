@@ -2,8 +2,11 @@ package tech.anvilcoder.feed;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -69,6 +72,37 @@ class LoopGuardTest {
         assertTrue(guard.ignoresPath("/api/feed/./events"));
         assertTrue(guard.ignoresPath("/api/feed/"));
         assertFalse(guard.ignoresPath("/api/feedback/create"));
+    }
+
+    /**
+     * Review finding 9. A rewrite rule or a permissive router can hand over a path exactly as it arrived,
+     * and a guard that matched it raw would answer "not ignored" for the ingest's own endpoint.
+     */
+    @Test
+    void anEncodedPathIsDecodedOnceBeforeItIsMatched() {
+        LoopGuard guard = new LoopGuard(List.of("/api/feed/**"));
+
+        assertTrue(guard.ignoresPath("/api/%66eed/events"), "%66 is 'f'");
+        assertTrue(guard.ignoresPath("/API/%46EED/events"));
+        assertTrue(guard.ignoresPath("/app/%2e%2e/api/feed/events"), "an encoded dot-dot segment");
+        assertTrue(guard.ignoresPath("/api/feed%2Fevents"), "an encoded separator is still a separator");
+        assertFalse(guard.ignoresPath("/api/%66eedback"));
+    }
+
+    /**
+     * Once, and not to a fixed point: decoding twice would turn {@code %2525} into {@code %} and make a
+     * literal segment somebody really serves match a pattern it does not.
+     */
+    @Test
+    void decodingHappensOnceAndABrokenEscapeIsLeftAlone() {
+        LoopGuard guard = new LoopGuard(List.of("/api/%/**"));
+
+        assertTrue(guard.ignoresPath("/api/%25/events"), "%25 decodes to the one percent the pattern has");
+        assertFalse(guard.ignoresPath("/api/%2525/events"), "decoded once, this is %25 and not %");
+
+        LoopGuard feed = new LoopGuard(List.of("/api/feed/**"));
+        assertTrue(feed.ignoresPath("/api/feed/ev%zz"), "an invalid escape is not an exception");
+        assertTrue(feed.ignoresPath("/api/feed/%"), "…and neither is a truncated one");
     }
 
     @Test
@@ -214,7 +248,88 @@ class LoopGuardTest {
         }
 
         assertTrue(allowed <= 3, "the overflow bucket caps them together, but " + allowed + " got through");
-        assertTrue(gate.suppressed("newcomer-0") > 0, "and the drops are countable, so they can be said");
+        assertTrue(gate.suppressedOverflow() > 0, "and the drops are countable, so they can be said");
+        assertEquals(0, gate.suppressed("newcomer-0"),
+                "a fingerprint the table never tracked has no count of its own — the bucket's is the "
+                        + "bucket's, and answering with it would name a storm about a fingerprint that "
+                        + "was never suppressed apart");
+    }
+
+    /** The edge the client says the storm line on, consumed under the gate's own lock. */
+    @Test
+    void theStormEdgeIsConsumedExactlyOncePerWindow() {
+        AtomicLong now = new AtomicLong(1_000L);
+        RateGate gate = new RateGate(1, 60_000, now::get);
+
+        assertTrue(gate.allow("f"));
+        assertFalse(gate.firstSuppression("f"), "nothing has been suppressed yet");
+        assertFalse(gate.allow("f"));
+        assertTrue(gate.firstSuppression("f"), "the first drop of this window");
+        assertFalse(gate.allow("f"));
+        assertFalse(gate.firstSuppression("f"), "and never again in this window");
+
+        now.addAndGet(61_000L);
+        assertTrue(gate.allow("f"));
+        assertFalse(gate.allow("f"));
+        assertTrue(gate.firstSuppression("f"), "a new window says it again");
+    }
+
+    /**
+     * The whole point of moving the edge into the gate. Two threads storming one fingerprint could each
+     * raise the counter past 1 and then both read 2, and the one line telling an operator that a storm is
+     * being suppressed locally was lost in exactly the case a storm arrives in.
+     */
+    @Test
+    void theStormEdgeSurvivesTwoThreadsStormingTogether() throws Exception {
+        AtomicLong now = new AtomicLong(1_000L);
+        RateGate gate = new RateGate(1, 60_000, now::get);
+        AtomicInteger said = new AtomicInteger();
+
+        int threads = 8;
+        CountDownLatch start = new CountDownLatch(1);
+        List<Thread> storm = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            Thread thread = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                for (int call = 0; call < 200; call++) {
+                    if (!gate.allow("f") && gate.firstSuppression("f")) {
+                        said.incrementAndGet();
+                    }
+                }
+            });
+            storm.add(thread);
+            thread.start();
+        }
+        start.countDown();
+        for (Thread thread : storm) {
+            thread.join();
+        }
+
+        assertEquals(1, said.get(), "exactly one thread got the edge, and exactly one line is written");
+    }
+
+    /** A fingerprint counted against the shared bucket still gets its window said once. */
+    @Test
+    void theStormEdgeIsSaidForAnOverflowedFingerprintToo() {
+        AtomicLong now = new AtomicLong(1_000L);
+        RateGate gate = new RateGate(1, 60_000, now::get);
+        for (int i = 0; i < 600; i++) {
+            gate.allow("live-" + i);
+        }
+
+        int said = 0;
+        for (int i = 0; i < 20; i++) {
+            if (!gate.allow("newcomer-" + i) && gate.firstSuppression("newcomer-" + i)) {
+                said++;
+            }
+        }
+        assertEquals(1, said, "the bucket's window is said once — an overflowed storm is neither silent "
+                + "nor a line per event");
     }
 
     @Test

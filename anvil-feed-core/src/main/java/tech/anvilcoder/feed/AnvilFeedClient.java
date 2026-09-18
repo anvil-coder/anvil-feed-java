@@ -57,6 +57,13 @@ public final class AnvilFeedClient implements AutoCloseable {
      */
     private static final ThreadLocal<String> REQUEST_PATH = new ThreadLocal<>();
 
+    /** What a disabled SDK sends with: nothing, built from nothing. See {@link #create(AnvilFeedConfig)}. */
+    private static final Transport NOT_SENDING =
+            (url, body, timeoutMs) -> IngestResponse.failure("anvil-feed is disabled; nothing was sent");
+
+    /** Where a misused {@link RequestScope} is reported when no client has been installed. */
+    private static final FeedLogger FALLBACK_LOGGER = FeedLogger.toSystemLogger();
+
     private final AnvilFeedConfig config;
     private final EventFactory factory;
     private final EventQueue queue;
@@ -68,9 +75,6 @@ public final class AnvilFeedClient implements AutoCloseable {
     private final AutoCloseable ownedTransport;
 
     private volatile UnaryOperator<Map<String, Object>> beforeSend;
-    private volatile boolean beforeSendFailureSaid;
-    private volatile boolean beforeSendReadOnlySaid;
-    private volatile boolean beforeSendUnsendableSaid;
 
     public AnvilFeedClient(AnvilFeedConfig config, EventFactory factory, EventQueue queue, Sender sender,
                            RateGate rateGate, LoopGuard loopGuard, FeedLogger logger) {
@@ -90,12 +94,22 @@ public final class AnvilFeedClient implements AutoCloseable {
         this.ownedTransport = ownedTransport;
     }
 
-    /** The whole SDK from a configuration and nothing else: the JDK transport, one logger, git discovered. */
+    /**
+     * The whole SDK from a configuration and nothing else: the JDK transport, one logger, git discovered.
+     *
+     * <p>A DISABLED configuration builds no {@link HttpTransport} at all (review finding 5). That
+     * constructor eagerly creates a named daemon executor and a pinned {@code HttpClient}, and in a
+     * deliberately disabled process — dev, CI, a host's own test suite — both would live for the life of
+     * the JVM without ever being used. What replaces it answers "not sent" and costs nothing.
+     */
     public static AnvilFeedClient create(AnvilFeedConfig config) {
         FeedLogger logger = FeedLogger.toSystemLogger();
+        GitContext git = GitContext.discover(Path.of(System.getProperty("user.dir", ".")));
+        if (!config.enabled()) {
+            return create(config, NOT_SENDING, logger, git, null, null, null);
+        }
         HttpTransport transport = new HttpTransport(config);
-        return create(config, transport, logger,
-                GitContext.discover(Path.of(System.getProperty("user.dir", "."))), null, null, transport);
+        return create(config, transport, logger, git, null, null, transport);
     }
 
     public static AnvilFeedClient create(AnvilFeedConfig config, Transport transport, FeedLogger logger,
@@ -123,18 +137,30 @@ public final class AnvilFeedClient implements AutoCloseable {
                                           AutoCloseable ownedTransport) {
         FeedLogger log = logger == null ? FeedLogger.toSystemLogger() : logger;
         GitContext context = git == null ? GitContext.none() : git;
-        Transport wire = transport == null ? new HttpTransport(config) : transport;
-        AutoCloseable owned = ownedTransport == null && transport == null ? (AutoCloseable) wire
-                : ownedTransport;
+        Transport wire = transport;
+        AutoCloseable owned = ownedTransport;
+        if (wire == null) {
+            // Same rule as create(config): nothing is built to send with when nothing will be sent.
+            if (config.enabled()) {
+                HttpTransport built = new HttpTransport(config);
+                wire = built;
+                owned = built;
+            } else {
+                wire = NOT_SENDING;
+            }
+        }
         EventQueue events = queue == null ? new EventQueue(config.maxQueueSize(), log) : queue;
         LongSupplier clock = clockMillis == null ? System::currentTimeMillis : clockMillis;
+        // ONE guard instance, shared with the sender: the sender raises the re-entrancy flag around every
+        // flush, on whichever thread the flush runs on, and the capture path below reads it.
+        LoopGuard guard = new LoopGuard(config.ignoredRequestPaths());
 
         return new AnvilFeedClient(config,
                 new EventFactory(config, new Scrubber(config.denylist()), context),
                 events,
-                new Sender(config, events, wire, log, clock),
+                new Sender(config, events, wire, log, clock, guard),
                 new RateGate(config.fingerprintCap(), config.fingerprintWindowMs(), clock),
-                new LoopGuard(config.ignoredRequestPaths()),
+                guard,
                 log, owned);
     }
 
@@ -144,22 +170,47 @@ public final class AnvilFeedClient implements AutoCloseable {
      * What the host is serving on THIS thread, for as long as the returned scope is open. FR-2 d (b): an
      * exception raised while serving {@code /api/feed/**} is the ingest's own failure and is not reported.
      *
+     * <p><b>Use it with try-with-resources, or with try/finally.</b> A scope that is never closed leaves
+     * its path on a POOLED request thread, and if that path matched an ignored pattern every later
+     * exception on that worker is dropped in silence — error reporting off for one thread, with nothing
+     * in any log:
+     *
      * <pre>{@code
      * try (AnvilFeedClient.RequestScope scope = AnvilFeedClient.enterRequest(request.getRequestURI())) {
      *     chain.doFilter(request, response);
      * }
      * }</pre>
      *
-     * <p>A full URL is accepted as readily as a path. Nothing in the SDK reads this value except the loop
-     * guard, and a capture whose own {@code context} carries a {@code request.url} uses that instead — an
-     * explicit context always wins.
+     * <p>javac's {@code -Xlint:try} warns when the resource variable is never referenced in the body, and
+     * this module (like every module in this build) compiles with {@code -Werror}. Either reference it or
+     * write the try/finally form:
+     *
+     * <pre>{@code
+     * AnvilFeedClient.enterRequest(uri);
+     * try { chain.doFilter(request, response); } finally { AnvilFeedClient.leaveRequest(); }
+     * }</pre>
+     *
+     * <p>Scopes NEST: closing an inner one restores the path the outer one set, which is the shape a
+     * servlet container's ERROR or FORWARD re-dispatch has. A scope may only be closed on the thread that
+     * opened it; a {@code close()} from anywhere else changes nothing and is said once, because clearing
+     * the closing thread's (empty) entry would leave the owner's path behind for ever.
+     *
+     * <p>A full URL is accepted as readily as a path, and the path is expected to be DECODED — the guard
+     * percent-decodes once as a backstop, but a host that hands over what it actually routed on is the
+     * only thing that can be relied on. Nothing in the SDK reads this value except the loop guard, and a
+     * capture whose own {@code context} carries a {@code request.url} uses that instead.
      */
     public static RequestScope enterRequest(String pathOrUrl) {
+        RequestScope scope = new RequestScope(Thread.currentThread(), REQUEST_PATH.get());
         REQUEST_PATH.set(pathOrUrl);
-        return AnvilFeedClient::leaveRequest;
+        return scope;
     }
 
-    /** Ends the scope. Idempotent; safe on a thread that never entered one. */
+    /**
+     * Clears this thread's path outright, ignoring any nesting — the counterpart of the try/finally form
+     * above, where there is one scope and nothing to restore. Idempotent. Prefer {@link RequestScope} in
+     * anything that can nest.
+     */
     public static void leaveRequest() {
         REQUEST_PATH.remove();
     }
@@ -169,11 +220,57 @@ public final class AnvilFeedClient implements AutoCloseable {
         return REQUEST_PATH.get();
     }
 
-    /** An {@link AutoCloseable} whose {@code close} throws nothing, so try-with-resources stays quiet. */
-    @FunctionalInterface
-    public interface RequestScope extends AutoCloseable {
+    /**
+     * One open request scope. Holds the thread that opened it and the path that was in force before, so
+     * that {@link #close()} restores rather than clears (nesting) and refuses to run anywhere else
+     * (thread affinity). Both were review finding 2.
+     */
+    public static final class RequestScope implements AutoCloseable {
+
+        private final Thread owner;
+        private final String previous;
+        private boolean closed;
+
+        private RequestScope(Thread owner, String previous) {
+            this.owner = owner;
+            this.previous = previous;
+        }
+
+        /** Restores the path this scope replaced. Idempotent, and a no-op on any other thread. */
         @Override
-        void close();
+        public void close() {
+            if (Thread.currentThread() != owner) {
+                // Clearing here would clear the CLOSING thread's entry and leave the owner's path in
+                // place for ever — on a pooled worker, error reporting silently off. Doing nothing at
+                // least leaves the owner able to close it itself.
+                scopeLogger().once("request-scope-thread",
+                        "anvil-feed: a request scope opened on \"" + owner.getName() + "\" was closed on \""
+                                + Thread.currentThread().getName() + "\". It was left open, because "
+                                + "closing it here would clear the wrong thread. Close the scope on the "
+                                + "thread that opened it — with an async hand-off, open a new scope on "
+                                + "the thread that continues the work. This is said once.");
+                return;
+            }
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (previous == null) {
+                REQUEST_PATH.remove();
+            } else {
+                REQUEST_PATH.set(previous);
+            }
+        }
+    }
+
+    /**
+     * The installed client's logger, so that a misused scope is reported where the host is already
+     * reading — and {@code System.err} when nothing has been installed, which is the only sink a static
+     * method can be sure of.
+     */
+    private static FeedLogger scopeLogger() {
+        AnvilFeedClient installed = AnvilFeed.current();
+        return installed == null ? FALLBACK_LOGGER : installed.logger;
     }
 
     // ------------------------------------------------------------------ capturing
@@ -290,16 +387,17 @@ public final class AnvilFeedClient implements AutoCloseable {
 
     // ------------------------------------------------------------------ the one path every capture takes
 
+    /**
+     * The re-entrancy flag is NOT raised here. {@link Sender#flush(long)} raises it, which is the one
+     * method every flush funnels through — this one, the daemon pump, the shutdown hook and
+     * {@link Sender#close()} — so it is raised on whichever thread actually sends (review finding 1).
+     * Raising it here as well would make the sender's own attempt re-entrant and drain nothing.
+     */
     private void flushGuarded(Runnable flush) {
-        if (!loopGuard.enterSend()) {
-            return;
-        }
         try {
             flush.run();
         } catch (RuntimeException | Error ours) {
             logger.warning("anvil-feed: flush failed: " + ours);
-        } finally {
-            loopGuard.leaveSend();
         }
     }
 
@@ -318,7 +416,9 @@ public final class AnvilFeedClient implements AutoCloseable {
             FeedEvent event = build.get();
             String fingerprint = Fingerprint.ofEvent(event.payload());
             if (!rateGate.allow(fingerprint)) {
-                sayTheStormOnce(fingerprint);
+                if (rateGate.firstSuppression(fingerprint)) {
+                    sayTheStorm(fingerprint);
+                }
                 return null;
             }
 
@@ -361,11 +461,11 @@ public final class AnvilFeedClient implements AutoCloseable {
             // documented API.
             modified = hook.apply(deepCopy(payload));
         } catch (RuntimeException | Error theirs) {
-            if (!beforeSendFailureSaid) {
-                beforeSendFailureSaid = true;
-                logger.warning("anvil-feed: beforeSend threw " + theirs.getClass().getName() + ": "
-                        + theirs.getMessage() + "; the event is sent unmodified and this is said once.");
-            }
+            // logger.once, not a volatile boolean of our own: a plain read-then-write races, and this
+            // module already has one mechanism for saying a thing once (review finding 8).
+            logger.once("beforeSend-threw", "anvil-feed: beforeSend threw " + theirs.getClass().getName()
+                    + ": " + theirs.getMessage()
+                    + "; the event is sent unmodified and this is said once.");
             return payload;
         }
         if (modified == null || modified.isEmpty()) {
@@ -424,9 +524,9 @@ public final class AnvilFeedClient implements AutoCloseable {
             result.put("exception", exception);
         }
 
-        if (!refused.isEmpty() && !beforeSendReadOnlySaid) {
-            beforeSendReadOnlySaid = true;
-            logger.warning("anvil-feed: beforeSend changed " + String.join(", ", refused)
+        if (!refused.isEmpty()) {
+            logger.once("beforeSend-read-only", "anvil-feed: beforeSend changed "
+                    + String.join(", ", refused)
                     + ", which this SDK owns; the change was ignored and this is said once.");
         }
         return result;
@@ -451,19 +551,20 @@ public final class AnvilFeedClient implements AutoCloseable {
         if (missing.isEmpty()) {
             return true;
         }
-        if (!beforeSendUnsendableSaid) {
-            beforeSendUnsendableSaid = true;
-            logger.warning("anvil-feed: beforeSend returned an event without " + String.join(", ", missing)
-                    + "; the ingest would refuse it, so it was dropped here. This is said once.");
-        }
+        logger.once("beforeSend-unsendable", "anvil-feed: beforeSend returned an event without "
+                + String.join(", ", missing)
+                + "; the ingest would refuse it, so it was dropped here. This is said once.");
         return false;
     }
 
-    /** One log line per window per fingerprint — the storm itself must not become the log flood. */
-    private void sayTheStormOnce(String fingerprint) {
-        if (rateGate.suppressed(fingerprint) != 1) {
-            return;
-        }
+    /**
+     * One log line per window per fingerprint — the storm itself must not become the log flood. The "once"
+     * is decided by {@link RateGate#firstSuppression}, under the gate's own lock: reading
+     * {@code suppressed(...) != 1} here was two synchronized calls with a gap between them, and two
+     * threads storming one fingerprint could step over the edge together and BOTH stay silent — losing
+     * the line in exactly the multi-threaded case a storm arrives in (review finding 3).
+     */
+    private void sayTheStorm(String fingerprint) {
         logger.warning("anvil-feed: more than " + config.fingerprintCap() + " occurrences of "
                 + fingerprint.substring(0, Math.min(12, fingerprint.length())) + " per "
                 + config.fingerprintWindowMs() + "ms; suppressing locally. The ingest counts occurrences "

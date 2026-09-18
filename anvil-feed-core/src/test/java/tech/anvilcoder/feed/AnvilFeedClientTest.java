@@ -9,6 +9,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -173,6 +176,71 @@ class AnvilFeedClientTest {
     }
 
     /**
+     * A servlet container's ERROR or FORWARD re-dispatch inside a request being served on an ignored path
+     * is exactly this shape. Without the restore, the inner {@code close()} cleared the path outright and
+     * the rest of that request reported the ingest's own failures to the ingest again.
+     */
+    @Test
+    void scopesNestAndTheInnerOneRestoresTheOuterPath() {
+        AnvilFeedClient client = client(config());
+
+        try (AnvilFeedClient.RequestScope outer = AnvilFeedClient.enterRequest("/api/feed/events")) {
+            assertNotNull(outer);
+            try (AnvilFeedClient.RequestScope inner = AnvilFeedClient.enterRequest("/error")) {
+                assertNotNull(inner);
+                assertEquals("/error", AnvilFeedClient.currentRequestPath());
+                assertNotNull(client.captureException(new RuntimeException("rendering the error page")));
+            }
+            assertEquals("/api/feed/events", AnvilFeedClient.currentRequestPath(),
+                    "the outer path is back, so the rest of the request is still guarded");
+            assertNull(client.captureException(new RuntimeException("the ingest itself failed")));
+        }
+        assertNull(AnvilFeedClient.currentRequestPath());
+        assertEquals(1, client.queue().size());
+    }
+
+    /**
+     * The dangerous direction. With an async servlet, a {@code CompletableFuture} hand-off or a
+     * virtual-thread continuation, {@code close()} runs on another thread: clearing there would clear the
+     * CLOSING thread's (empty) entry and leave the owner's path in place for ever — and on a pooled
+     * request worker whose stale path matched an ignored pattern, that is error reporting silently off
+     * for that worker (review finding 2).
+     */
+    @Test
+    void aScopeClosedOnAnotherThreadIsRefusedAndSaidOnce() throws Exception {
+        AnvilFeedClient client = client(config());
+        AnvilFeed.init(client);
+
+        AnvilFeedClient.RequestScope scope = AnvilFeedClient.enterRequest("/api/bookings/17");
+        try {
+            Thread other = new Thread(scope::close, "some-other-pool-thread");
+            other.start();
+            other.join();
+            Thread again = new Thread(scope::close, "some-other-pool-thread");
+            again.start();
+            again.join();
+
+            assertEquals("/api/bookings/17", AnvilFeedClient.currentRequestPath(),
+                    "the owner's path is untouched, so the owner can still close it itself");
+            assertEquals(1, log.matching("closed on").size(), "said once, not once per hand-off");
+        } finally {
+            scope.close();
+        }
+        assertNull(AnvilFeedClient.currentRequestPath(), "and the owner's own close still works");
+    }
+
+    /** Closing twice on the owner's thread is not a second restore of a path that has moved on since. */
+    @Test
+    void closingAScopeTwiceOnItsOwnThreadIsANoOp() {
+        AnvilFeedClient.RequestScope first = AnvilFeedClient.enterRequest("/a");
+        first.close();
+        AnvilFeedClient.enterRequest("/b");
+        first.close();
+
+        assertEquals("/b", AnvilFeedClient.currentRequestPath());
+    }
+
+    /**
      * The first turn of the loop this whole class exists to stop: the transport fails, the SDK captures
      * its own failure, and the capture is queued to be posted to the endpoint that just failed.
      */
@@ -190,6 +258,46 @@ class AnvilFeedClientTest {
 
         assertEquals(1, holder[0].queue().size(),
                 "only the original event is left — the sender never queued its own failure");
+    }
+
+    /**
+     * The same loop, on the thread that actually sends once a host calls {@code start()} — which Task 10's
+     * starter does. The flag used to be raised by the CLIENT around its own {@code flush()}, so it was
+     * raised on the one thread that rarely sends and never on the daemon pump, where every post leaves.
+     * A {@link Transport} — or a host logging appender reached through {@link FeedLogger} on the send
+     * path — that captured from its own error branch was captured, queued and posted to the endpoint that
+     * had just failed, silently, because the pump absorbs whatever it raises (review finding 1).
+     */
+    @Test
+    void theDaemonPumpsOwnFailureIsNeverCapturedEither() throws Exception {
+        CountDownLatch posted = new CountDownLatch(1);
+        AtomicInteger postsFromThePump = new AtomicInteger();
+        Transport reentrant = (url, body, timeoutMs) -> {
+            if (Thread.currentThread().getName().startsWith("anvil-feed-sender")) {
+                postsFromThePump.incrementAndGet();
+                // Exactly what a host's own transport or appender does in its error branch.
+                AnvilFeed.captureException(new IllegalStateException("the ingest itself failed"));
+                posted.countDown();
+            }
+            return IngestResponse.failure("connection reset by peer");
+        };
+        AnvilFeedClient client = AnvilFeedClient.create(AnvilFeedConfig.builder()
+                        .token("anv_srv_0123456789abcdef0123456789abcdef")
+                        .service("shop-api").flushIntervalMs(1).build(log.logger()),
+                reentrant, log.logger(), GitContext.none());
+        AnvilFeed.init(client);
+        assertNotNull(client.captureException(new RuntimeException("boom")));
+
+        client.start();
+        try {
+            assertTrue(posted.await(10, TimeUnit.SECONDS), "the pump never posted");
+        } finally {
+            client.close();
+        }
+
+        assertTrue(postsFromThePump.get() >= 1, "the assertion below has to be about the pump's thread");
+        assertEquals(1, client.queue().size(),
+                "only the original event is left — the pump never queued its own failure");
     }
 
     /** FR-2 b, the whole of it: nothing in here ever reaches the caller. */
@@ -522,11 +630,14 @@ class AnvilFeedClientTest {
     @Test
     void initIsIdempotent() {
         AnvilFeedConfig disabled = AnvilFeedConfig.builder().service("shop-api").build(log.logger());
+        long httpThreadsBefore = httpClientThreads();
 
         AnvilFeedClient first = AnvilFeed.init(disabled);
         AnvilFeedClient second = AnvilFeed.init(disabled);
 
         assertSame(first, second, "the second init built nothing");
+        assertEquals(httpThreadsBefore, httpClientThreads(),
+                "a deliberately disabled process pays for no HttpClient and no executor (finding 5)");
         assertSame(first, AnvilFeed.current());
         assertNull(AnvilFeed.captureException(new RuntimeException("boom")), "the disabled path is silent");
         assertFalse(first.sender().isRunning(), "a disabled configuration pays for no thread at all");
@@ -548,6 +659,13 @@ class AnvilFeedClientTest {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /** The named pool {@code HttpTransport} creates in its constructor; zero of them is the assertion. */
+    private static long httpClientThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().startsWith("anvil-feed-http-"))
+                .count();
+    }
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> asMap(Object value) {

@@ -33,6 +33,8 @@ public final class RateGate {
         long start;
         int count;
         int suppressed;
+        /** Consumed once per window by {@link RateGate#firstSuppression}. */
+        boolean stormSaid;
 
         Window(long start) {
             this.start = start;
@@ -97,17 +99,45 @@ public final class RateGate {
     }
 
     /**
-     * How many events the current window has dropped for that fingerprint — and, for one the table had no
-     * room for, how many the overflow bucket it was counted against has dropped. Zero for a fingerprint
-     * that has not been seen. The caller uses {@code 1} as the edge that says the line about the storm
-     * once per window.
+     * How many events the current window has dropped FOR THAT FINGERPRINT. Zero for one that is not
+     * tracked apart — never seen, expired and evicted, or counted against the shared bucket; ask
+     * {@link #suppressedOverflow()} for that one.
+     *
+     * <p>It used to fall back to the overflow bucket, faithfully to the PHP twin, and the javadoc's
+     * "zero for a fingerprint that has not been seen" was then untrue the moment the bucket was
+     * non-empty: a caller could be told a storm about a fingerprint that had never been suppressed at all
+     * (review finding 4). The two counters are two different facts and are now two different questions.
      */
     public synchronized int suppressed(String fingerprint) {
         Window window = windows.get(fingerprint);
-        if (window != null) {
-            return window.suppressed;
-        }
+        return window == null ? 0 : window.suppressed;
+    }
+
+    /** How many events the SHARED bucket has dropped in its current window — the ones nothing tracked. */
+    public synchronized int suppressedOverflow() {
         return overflow == null ? 0 : overflow.suppressed;
+    }
+
+    /**
+     * True exactly ONCE per window for the thing that just suppressed this fingerprint — its own window,
+     * or the shared bucket when the table had no room to track it apart. Call it only immediately after
+     * {@link #allow} has answered false; by construction, whatever just refused is what this consumes the
+     * edge on.
+     *
+     * <p>It lives here, under the gate's own lock, because the caller's version of it — read
+     * {@code suppressed(...)} and compare with 1 — was two synchronized calls with a gap in between.
+     * Two threads storming one fingerprint could each raise the counter and then both read 2, and the one
+     * line telling an operator that a storm is being suppressed locally was lost in exactly the
+     * multi-threaded case a storm arrives in (review finding 3).
+     */
+    public synchronized boolean firstSuppression(String fingerprint) {
+        Window window = windows.get(fingerprint);
+        Window target = window != null ? window : overflow;
+        if (target == null || target.suppressed == 0 || target.stormSaid) {
+            return false;
+        }
+        target.stormSaid = true;
+        return true;
     }
 
     /** How many fingerprints are tracked apart. Package-private: a guard, not API. */
