@@ -491,10 +491,15 @@ class ConfigParityTest {
     }
 
     /**
-     * The four accepted and the six dropped shapes PHP pins, plus the FLOAT rows PHP's parity round handed
-     * to this task: an integral float is the integer it is, a non-integral one is not a status code at all.
-     * PHP drops every float today, which is the one row of this table the two languages do not yet share —
-     * see the task-9 report.
+     * The accepted and dropped shapes PHP pins, in the same order, plus the rows that are Java-only
+     * because Java has the types for them ({@code Long}, {@code BigInteger}, {@code short},
+     * {@code BigDecimal} — PHP has one integer type and one float type).
+     *
+     * <p>The float rows were the last divergence: at the time of the task-9 report PHP dropped EVERY
+     * float, and this javadoc said so. It landed in {@code 51fc722} and PHP's own table now carries
+     * {@code 'an integral float' => [200.0, 200]}, so there is no row of this table the two languages do
+     * not share. Checked rather than assumed, because a comment that describes the other language is a
+     * comment nothing in this module can keep honest.
      */
     static Stream<Arguments> statusCodes() {
         return Stream.of(
