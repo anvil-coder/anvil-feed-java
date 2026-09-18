@@ -115,8 +115,11 @@ class ConfigParityTest {
      * is a two-language contract: adding the key to {@code conformance/config-defaults.json} makes PHP's
      * {@code testEveryDefaultMatchesTheSharedList} red for a parameter PHP does not have, and the Spring
      * starter (task 10) needs the knob now. The exemption is therefore the DECISION "Java first, PHP next"
-     * written down where it is read, and not a silent omission. Task 11 / the spec owners move it into the
-     * shared list together with PHP's half, in one change to both languages.
+     * written down where it is read, and not a silent omission. Since task 11 the same decision is also in
+     * {@code conformance/config-defaults.json}'s {@code language_specific} block, where the other language
+     * and a human reader find it, and {@link #theLanguageSpecificBlockAgreesWithThisSdksExemptions()} holds
+     * the two copies to each other. Moving the knob into the shared list therefore takes three edits in
+     * one change — this map, that block, and PHP's half.
      */
     private static final Map<String, String> NOT_IN_THE_SHARED_LIST = Map.of(
             "token", "no default: without it the SDK is switched off rather than guessing one",
@@ -125,6 +128,16 @@ class ConfigParityTest {
             "enabled", "derived from the three above, not a value an operator sets on its own",
             "inAppPackages", "Java-only today: the shared list is a two-language contract and PHP has no "
                     + "namespace equivalent yet. It joins the list together with PHP's half.");
+
+    /**
+     * The exemptions that are NOT a language decision: three parameters with no default at all, and one
+     * derived from them. Separating them out is what lets {@link
+     * #theLanguageSpecificBlockAgreesWithThisSdksExemptions()} say anything about the rest — without it,
+     * "exempt" would be one word covering two entirely different reasons and the file could never be
+     * checked against it.
+     */
+    private static final List<String> NO_DEFAULT_OR_DERIVED =
+            List.of("token", "service", "release", "enabled");
 
     /**
      * The other direction, and the one this test was missing: every component {@link AnvilFeedConfig}
@@ -170,12 +183,121 @@ class ConfigParityTest {
         return camel.replaceAll("(?<!^)([A-Z])", "_$1").toLowerCase(Locale.ROOT);
     }
 
+    /**
+     * The keys of {@code config-defaults.json} that are NOT parameters, and so are no part of the
+     * name-and-value contract the two tests above enforce.
+     *
+     * <p>Each of them is held to something of its own instead — {@link
+     * #theEnvBlockNamesTheFiveVariablesThisSdkReads()} and {@link
+     * #theLanguageSpecificBlockAgreesWithThisSdksExemptions()}. That pairing is the rule this list carries:
+     * a name added here without a test added with it turns a contract file into a file with prose in it,
+     * and prose in a contract is what goes quietly wrong while every guard stays green.
+     */
+    private static final List<String> NOT_A_PARAMETER = List.of("note", "env", "language_specific");
+
     private static List<String> sharedListKeys() throws Exception {
         JsonNode file = JSON.readTree(Files.readString(CONFORMANCE.resolve("config-defaults.json")));
         List<String> keys = new ArrayList<>();
         file.fieldNames().forEachRemaining(keys::add);
-        keys.remove("note");
+        keys.removeAll(NOT_A_PARAMETER);
         return keys;
+    }
+
+    /**
+     * The {@code env} block of {@code config-defaults.json}, held against the names this SDK actually asks
+     * the environment for and against the parameter each one is declared to fill.
+     *
+     * <p>{@link #theFiveEnvironmentVariableNamesAreTheOnesPhpReads()} pins the five names inside this test
+     * class. This one pins the FILE to the same five, and the difference is the whole point: the file is
+     * what the other language's twin reads and what a human consults, and until this test existed the
+     * block could have named a sixth variable, or misspelled one of the five, with nothing anywhere going
+     * red. The lookup is driven with an environment that answers {@code null} to everything, because what
+     * is being measured is which names are ASKED for, not what comes back.
+     */
+    @Test
+    void theEnvBlockNamesTheFiveVariablesThisSdkReads() throws Exception {
+        Map<String, String> declared = new LinkedHashMap<>();
+        JSON.readTree(Files.readString(CONFORMANCE.resolve("config-defaults.json"))).path("env").fields()
+                .forEachRemaining(field -> {
+                    if (!"note".equals(field.getKey())) {
+                        declared.put(field.getKey(), field.getValue().asText());
+                    }
+                });
+
+        List<String> asked = new ArrayList<>();
+        AnvilFeedConfig.fromEnvironment(FeedLogger.toSystemLogger(), name -> {
+            asked.add(name);
+            return null;
+        });
+
+        assertThat(asked)
+                .describedAs("the env block of config-defaults.json names a variable this SDK never reads, "
+                        + "or this SDK reads one the block does not name")
+                .containsExactlyInAnyOrderElementsOf(declared.keySet());
+
+        List<String> parameters = Arrays.stream(AnvilFeedConfig.class.getRecordComponents())
+                .map(RecordComponent::getName).map(ConfigParityTest::snakeCase).toList();
+        assertThat(parameters)
+                .describedAs("the env block maps a variable onto a parameter this SDK does not have")
+                .containsAll(declared.values());
+    }
+
+    /**
+     * The {@code language_specific} block, held against this test class's own exemption list.
+     *
+     * <p>An entry naming {@code java} alone is the written-down form of one decision: this knob exists in
+     * Java and does not exist in PHP yet. That decision necessarily lives in two places — in {@link
+     * #NOT_IN_THE_SHARED_LIST}, where the parity tests read it, and in the shared file, where the other
+     * language and a human reader do — and two places is precisely how a decision comes apart. This test
+     * makes them one place: on the day PHP grows the knob, the exemption goes, and the entry has to go
+     * with it into the parameter list, or this is red.
+     *
+     * <p>An entry naming BOTH languages is the opposite claim — a parameter of the list above whose
+     * meaning is the same on both sides — and it is checked as that: it has to be in the shared list, and
+     * it has to say so.
+     */
+    @Test
+    void theLanguageSpecificBlockAgreesWithThisSdksExemptions() throws Exception {
+        JsonNode block = JSON.readTree(Files.readString(CONFORMANCE.resolve("config-defaults.json")))
+                .path("language_specific");
+
+        List<String> javaOnly = new ArrayList<>();
+        List<String> bothLanguages = new ArrayList<>();
+        block.fields().forEachRemaining(entry -> {
+            if ("note".equals(entry.getKey())) {
+                return;
+            }
+            List<String> languages = strings(entry.getValue().path("languages"));
+            assertThat(languages)
+                    .describedAs("%s names no language, so it says nothing at all", entry.getKey())
+                    .isNotEmpty();
+            if (languages.equals(List.of("java"))) {
+                javaOnly.add(entry.getKey());
+            } else {
+                bothLanguages.add(entry.getKey());
+                assertThat(entry.getValue().path("semantics").asText())
+                        .describedAs("%s claims both languages without claiming they mean the same thing, "
+                                + "which is the one thing a reader consults this block for", entry.getKey())
+                        .isEqualTo("identical");
+            }
+        });
+
+        // The exemptions that are a LANGUAGE decision. The other four are exempt for a reason that has
+        // nothing to do with a language: three have no default at all and one is derived from them.
+        List<String> exemptedForBeingJavaOnly = NOT_IN_THE_SHARED_LIST.keySet().stream()
+                .filter(name -> !NO_DEFAULT_OR_DERIVED.contains(name))
+                .map(ConfigParityTest::snakeCase)
+                .sorted().toList();
+
+        assertThat(javaOnly.stream().sorted().toList())
+                .describedAs("a knob exempt from the shared list for being Java-only has to say so in "
+                        + "conformance/config-defaults.json, and nothing else may claim to be")
+                .isEqualTo(exemptedForBeingJavaOnly);
+
+        assertThat(sharedListKeys())
+                .describedAs("language_specific calls a parameter shared that the parameter list does not "
+                        + "carry")
+                .containsAll(bothLanguages);
     }
 
     // ================================================================= the environment variables
@@ -388,6 +510,9 @@ class ConfigParityTest {
 
                 // Out of a signed 32-bit int: DROPPED, never wrapped. intValue() made 5000000000 into
                 // 705032704 and sent it, which is the same defect the float rows below were fixed for.
+                // The first row is Integer.MAX_VALUE + 1 exactly: a bound is only proven at the step that
+                // crosses it, and 5000000000 is far enough past the edge to pass an off-by-one bound.
+                Arguments.of(2_147_483_648L, null),
                 Arguments.of(5_000_000_000L, null),
                 Arguments.of(-5_000_000_000L, null),
                 Arguments.of(new BigInteger("99999999999"), null),
