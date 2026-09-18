@@ -16,8 +16,11 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.UnaryOperator;
 
 /**
@@ -61,8 +64,13 @@ public final class HttpTransport implements Transport, AutoCloseable {
     /** A budget below this is not a request, it is a failure that costs a socket. */
     private static final int MINIMUM_BUDGET_MS = 1;
 
+    /** Names the pool in a customer's thread dump; a nameless {@code HttpClient-1-Worker-N} does not. */
+    private static final AtomicInteger POOL_NUMBER = new AtomicInteger();
+
     private final AnvilFeedConfig config;
     private final HttpClient client;
+    private final ExecutorService executor;
+    private final ProxySelector proxies;
 
     public HttpTransport(AnvilFeedConfig config) {
         this(config, System::getenv);
@@ -70,11 +78,27 @@ public final class HttpTransport implements Transport, AutoCloseable {
 
     HttpTransport(AnvilFeedConfig config, UnaryOperator<String> environment) {
         this.config = config;
+        this.proxies = proxySelector(environment);
+        // Bounded and named (review finding 10). Concurrency here is exactly one — every post comes from
+        // inside one sender's flush — so a cached pool is capacity nobody uses, and its threads show up
+        // in a customer's thread dump with no hint of who owns them. Daemon, so it can never hold a JVM.
+        int pool = POOL_NUMBER.incrementAndGet();
+        this.executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "anvil-feed-http-" + pool);
+            thread.setDaemon(true);
+            return thread;
+        });
         HttpClient.Builder builder = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(Math.max(1, config.connectTimeoutMs())))
                 // FR-9: the token goes to the configured endpoint and to nowhere else.
                 .followRedirects(HttpClient.Redirect.NEVER)
-                .proxy(proxySelector(environment));
+                // Pinned. The ingest is behind nginx, which routes `^~ /api/feed/` to query-svc over
+                // HTTP/1.1; the default HTTP_2 costs an `Upgrade: h2c` probe on a plaintext endpoint and
+                // an ALPN negotiation on a TLS one, neither of which can win anything for a single small
+                // POST — and a corporate proxy in the path (C11) is the least likely hop to speak h2.
+                .version(HttpClient.Version.HTTP_1_1)
+                .executor(executor)
+                .proxy(proxies);
         Authenticator proxyCredentials = proxyAuthenticator(environment);
         if (proxyCredentials != null) {
             builder = builder.authenticator(proxyCredentials);
@@ -104,10 +128,16 @@ public final class HttpTransport implements Transport, AutoCloseable {
             exchange = client.sendAsync(request, HttpResponse.BodyHandlers.ofString());
             HttpResponse<String> response = exchange.get(budgetMs, TimeUnit.MILLISECONDS);
 
-            return IngestResponse.of(
+            // C16: a 407 is the PROXY's answer, and the proxy's identity is the one piece of routing only
+            // the transport knows. It travels in `failureReason` so the Sender's 407 line can name it —
+            // host and port only, never a credential (C15/X11).
+            String proxy = response.statusCode() == 407 ? describeProxyFor(url) : "";
+            return new IngestResponse(
                     response.statusCode(),
                     response.body(),
                     retryAfter(response),
+                    false,
+                    proxy,
                     response.headers().firstValue("Location").orElse(null));
         } catch (TimeoutException tooSlow) {
             return IngestResponse.failure("the ingest did not answer within the budget of " + budgetMs + "ms");
@@ -128,13 +158,43 @@ public final class HttpTransport implements Transport, AutoCloseable {
         }
     }
 
-    /** Releases the client's selector and executor threads. */
+    /**
+     * The proxy this URL would be routed through, as {@code host:port} and nothing else. C15/X11: a
+     * credential — cleartext or Base64 — never appears here, which is why the userinfo of the configured
+     * proxy URL is deliberately not read.
+     */
+    String describeProxyFor(String url) {
+        try {
+            for (Proxy proxy : proxies.select(URI.create(url))) {
+                if (proxy.type() != Proxy.Type.DIRECT && proxy.address() instanceof InetSocketAddress at) {
+                    return "the proxy " + at.getHostString() + ":" + at.getPort();
+                }
+            }
+        } catch (RuntimeException noRoutingToReport) {
+            // A description is a nicety; failing to build one may not change the answer.
+        }
+        return "";
+    }
+
+    /**
+     * Releases the client's selector and executor threads, <b>without waiting</b>.
+     *
+     * <p>{@code HttpClient.close()} is an orderly shutdown that blocks until every in-flight operation
+     * has finished — which, behind a counterparty that dribbles, is the same unbounded wait this class
+     * exists to prevent one level up. {@code shutdownNow()} cancels instead. FR-2 (c) is a bound on the
+     * call, and closing is a call.
+     */
     @Override
     public void close() {
         try {
-            client.close();
+            client.shutdownNow();
         } catch (RuntimeException | Error neverTheHostsProblem) {
             // FR-2 b applies to shutdown too.
+        }
+        try {
+            executor.shutdownNow();
+        } catch (RuntimeException | Error neverTheHostsProblem) {
+            // Likewise.
         }
     }
 
@@ -172,8 +232,12 @@ public final class HttpTransport implements Transport, AutoCloseable {
      * a credential ends up somewhere it was never meant to go.
      */
     static Authenticator proxyAuthenticator(UnaryOperator<String> environment) {
-        String user = System.getProperty("http.proxyUser");
-        char[] password = toChars(System.getProperty("http.proxyPassword"));
+        // BOTH pairs. An operator with an https endpoint sets the https.* pair, which is the ordinary
+        // thing to do and which reading only http.* turned into a silent 407 (review finding 8).
+        String user = firstPresent(System.getProperty("https.proxyUser"),
+                System.getProperty("http.proxyUser"));
+        char[] password = toChars(firstPresent(System.getProperty("https.proxyPassword"),
+                System.getProperty("http.proxyPassword")));
         if (user == null || user.isBlank()) {
             URI fromEnvironment = firstProxyUri(environment);
             String userInfo = fromEnvironment == null ? null : fromEnvironment.getUserInfo();
@@ -202,6 +266,10 @@ public final class HttpTransport implements Transport, AutoCloseable {
         return value == null ? new char[0] : value.toCharArray();
     }
 
+    private static String firstPresent(String preferred, String fallback) {
+        return preferred != null && !preferred.isBlank() ? preferred : fallback;
+    }
+
     private static URI firstProxyUri(UnaryOperator<String> environment) {
         for (String name : List.of("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                 "ALL_PROXY", "all_proxy")) {
@@ -227,15 +295,27 @@ public final class HttpTransport implements Transport, AutoCloseable {
     }
 
     /**
-     * {@code NO_PROXY} semantics as curl and every runtime around it implement them: a comma-separated
-     * list of hosts, {@code *} for "never proxy anything", a leading dot or a bare domain matching any
-     * subdomain, and an optional {@code :port}.
+     * {@code NO_PROXY} semantics as curl and Go's {@code httpproxy} implement them: a comma-separated
+     * list, {@code *} for "never proxy anything", a leading dot or a bare domain matching any subdomain,
+     * an optional {@code :port} — and, since the task-7 review's finding 7, IP literals that are compared
+     * as addresses rather than as names.
+     *
+     * <p>Three cases the naive suffix rule got wrong:
+     * <ul>
+     *   <li>{@code ::1} was split at its last colon into host {@code ::} and port {@code 1}, so an IPv6
+     *       loopback endpoint went through the proxy however the operator spelled the bypass. A port is
+     *       only split off when the entry is bracketed or holds at most one colon.</li>
+     *   <li>{@code NO_PROXY=0.0.1} bypassed {@code 10.0.0.1} through {@code endsWith(".0.0.1")}. The
+     *       subdomain rule is for NAMES; an IP literal must match exactly.</li>
+     *   <li>{@code 192.168.0.0/16} was not understood at all, though it is the form an operator with a
+     *       corporate proxy reaches for first.</li>
+     * </ul>
      */
     static boolean bypasses(String noProxy, String host, int port) {
-        if (noProxy == null || noProxy.isBlank() || host == null) {
+        if (noProxy == null || noProxy.isBlank() || host == null || host.isBlank()) {
             return false;
         }
-        String target = host.toLowerCase(Locale.ROOT);
+        String target = unbracket(host.toLowerCase(Locale.ROOT));
         for (String rawEntry : noProxy.split(",")) {
             String entry = rawEntry.trim().toLowerCase(Locale.ROOT);
             if (entry.isEmpty()) {
@@ -244,19 +324,101 @@ public final class HttpTransport implements Transport, AutoCloseable {
             if ("*".equals(entry)) {
                 return true;
             }
-            int colon = entry.lastIndexOf(':');
-            if (colon > 0 && entry.substring(colon + 1).chars().allMatch(Character::isDigit)) {
-                if (port != Integer.parseInt(entry.substring(colon + 1))) {
+            if (entry.contains("/")) {
+                if (matchesCidr(entry, target)) {
+                    return true;
+                }
+                continue;
+            }
+
+            String candidate = entry;
+            int colon = candidate.lastIndexOf(':');
+            boolean portIsSplittable = candidate.startsWith("[")
+                    ? candidate.indexOf(']') < colon
+                    : candidate.indexOf(':') == colon;
+            if (colon > 0 && portIsSplittable
+                    && !candidate.substring(colon + 1).isEmpty()
+                    && candidate.substring(colon + 1).chars().allMatch(Character::isDigit)) {
+                if (port != Integer.parseInt(candidate.substring(colon + 1))) {
                     continue;
                 }
-                entry = entry.substring(0, colon);
+                candidate = candidate.substring(0, colon);
             }
-            String suffix = entry.startsWith(".") ? entry.substring(1) : entry;
-            if (target.equals(suffix) || target.endsWith("." + suffix)) {
+            candidate = unbracket(candidate);
+
+            if (isIpLiteral(candidate) || isIpLiteral(target)) {
+                // Addresses, not names: no suffix rule, and ::1 == 0:0:0:0:0:0:0:1.
+                if (sameAddress(candidate, target)) {
+                    return true;
+                }
+                continue;
+            }
+            String suffix = candidate.startsWith(".") ? candidate.substring(1) : candidate;
+            if (!suffix.isEmpty() && (target.equals(suffix) || target.endsWith("." + suffix))) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static String unbracket(String value) {
+        return value.startsWith("[") && value.endsWith("]") && value.length() > 2
+                ? value.substring(1, value.length() - 1)
+                : value;
+    }
+
+    private static boolean isIpLiteral(String value) {
+        return value.indexOf(':') >= 0
+                || (!value.isEmpty() && value.chars().allMatch(c -> (c >= '0' && c <= '9') || c == '.')
+                    && value.indexOf('.') > 0);
+    }
+
+    private static boolean sameAddress(String left, String right) {
+        if (left.equals(right)) {
+            return true;
+        }
+        byte[] a = addressOf(left);
+        byte[] b = addressOf(right);
+        return a != null && b != null && java.util.Arrays.equals(a, b);
+    }
+
+    /** {@code 192.168.0.0/16} and {@code fd00::/8}. Never resolves: a literal or nothing. */
+    private static boolean matchesCidr(String entry, String target) {
+        int slash = entry.lastIndexOf('/');
+        byte[] network = addressOf(unbracket(entry.substring(0, slash)));
+        byte[] address = addressOf(target);
+        if (network == null || address == null || network.length != address.length) {
+            return false;
+        }
+        int bits;
+        try {
+            bits = Integer.parseInt(entry.substring(slash + 1).trim());
+        } catch (NumberFormatException notAPrefix) {
+            return false;
+        }
+        if (bits < 0 || bits > network.length * 8) {
+            return false;
+        }
+        for (int i = 0; i < bits; i++) {
+            int mask = 0x80 >> (i % 8);
+            if ((network[i / 8] & mask) != (address[i / 8] & mask)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The bytes of an IP LITERAL, or null. Never a DNS lookup — a bypass list may not cost a resolve. */
+    private static byte[] addressOf(String literal) {
+        if (literal == null || literal.isEmpty() || !isIpLiteral(literal)) {
+            return null;
+        }
+        try {
+            return java.net.InetAddress.getByName(
+                    literal.indexOf(':') >= 0 ? "[" + literal + "]" : literal).getAddress();
+        } catch (java.net.UnknownHostException notALiteral) {
+            return null;
+        }
     }
 
     /** C11 in one place, and testable without a live proxy in front of it. */

@@ -117,6 +117,63 @@ class ProxySupportTest {
         }
     }
 
+    /**
+     * The 407 nobody can answer, which is the case the operator profile of 2026-09-04 actually produces:
+     * credentials absent, mistyped or rotated — or the proxy in front of <b>https</b>, where the JDK
+     * refuses Basic on a {@code CONNECT} tunnel by default and the SDK cannot answer at all.
+     *
+     * <p>Before the task-7 review this fell through to "the ingest answered an unexpected 407": the batch
+     * was dropped, the line named the wrong component, and every later event went in silence.
+     */
+    @Test
+    void anUnanswerable407NamesTheProxyAndKeepsTheEvents() throws Exception {
+        LocalIngest.Answer alwaysChallenging = (exchange, body) -> {
+            exchange.getResponseHeaders().add("Proxy-Authenticate", "Basic realm=\"corp\"");
+            exchange.sendResponseHeaders(407, -1);
+            exchange.close();
+        };
+        RecordingLogger written = new RecordingLogger();
+
+        try (LocalIngest proxy = LocalIngest.alwaysAnswering(alwaysChallenging)) {
+            AnvilFeedConfig config = AnvilFeedConfig.builder()
+                    .token(TOKEN).service("shop-api").endpoint(UNREACHABLE)
+                    .requestTimeoutMs(4_000).connectTimeoutMs(2_000)
+                    .build(written.logger());
+
+            EventQueue queue = new EventQueue(1000, written.logger());
+            queue.push(new FeedEvent("11111111-1111-4111-8111-111111111111",
+                    Map.of("event_id", "11111111-1111-4111-8111-111111111111")));
+
+            // No credentials anywhere: the challenge cannot be answered.
+            try (HttpTransport transport = new HttpTransport(config,
+                    environment(Map.of("HTTP_PROXY", proxy.url(""))))) {
+
+                Sender sender = new Sender(config, queue, transport, written.logger(), () -> 1_000_000L);
+                sender.flush();
+
+                assertThat(queue.size())
+                        .describedAs("every event this SDK exists to deliver would otherwise be discarded "
+                                + "in the one environment C11/C15 were written for")
+                        .isEqualTo(1);
+                assertThat(sender.isStopped()).isFalse();
+            }
+
+            List<String> said = written.matching("PROXY refused");
+            assertThat(said).hasSize(1);
+            assertThat(said.get(0))
+                    .describedAs("it names the proxy, not the Anvil ingest")
+                    .contains("PROXY refused")
+                    .contains("127.0.0.1");
+            assertThat(written.matching("unexpected"))
+                    .describedAs("never the generic 4xx row, which drops and then goes silent")
+                    .isEmpty();
+            assertThat(String.join("\n", written.lines()))
+                    .describedAs("C15/X11 in the line the operator actually reads")
+                    .doesNotContain("s3cr3t")
+                    .doesNotContain(TOKEN);
+        }
+    }
+
     @Test
     void theJvmsOwnProxySettingsWinOverTheEnvironment() {
         ProxySelector jvm = new ProxySelector() {
@@ -177,6 +234,25 @@ class ProxySupportTest {
             "'example.com:8080',api.example.com,     8080, true",
             "'example.com:8080',api.example.com,      443, false",
             "'',                api.example.com,      443, false",
+            // IPv6 literals. `::1` was split at its LAST colon into host `::` and port `1`, so an IPv6
+            // loopback endpoint went through the proxy however the operator spelled the bypass.
+            "'::1',             ::1,                  443, true",
+            "'::1',             '[::1]',              443, true",
+            "'[::1]',           ::1,                  443, true",
+            "'[::1]:8080',      ::1,                 8080, true",
+            "'[::1]:8080',      ::1,                  443, false",
+            "'::1',             0:0:0:0:0:0:0:1,      443, true",
+            "'fd00::1',         fd00::2,              443, false",
+            // The subdomain rule is for NAMES: `0.0.1` bypassed `10.0.0.1` by suffix match on an address.
+            "'0.0.1',           10.0.0.1,             443, false",
+            "'10.0.0.1',        10.0.0.1,             443, true",
+            // CIDR — what curl and Go's httpproxy accept, and what an operator reaches for first.
+            "'192.168.0.0/16',  192.168.44.7,         443, true",
+            "'192.168.0.0/16',  192.169.44.7,         443, false",
+            "'10.0.0.0/8',      10.255.3.1,           443, true",
+            "'fd00::/8',        fd00::99,             443, true",
+            "'fd00::/8',        fe00::99,             443, false",
+            "'192.168.0.0/junk',192.168.44.7,         443, false",
     })
     void noProxySemanticsAreTheOnesEveryOtherRuntimeImplements(String noProxy, String host, int port,
                                                                boolean bypasses) {
@@ -196,6 +272,43 @@ class ProxySupportTest {
         assertThat(leaked).doesNotContain("s3cr3t-proxy-pw");
         assertThat(leaked).doesNotContain(TOKEN);
         assertThat(leaked).contains("[Filtered]");
+    }
+
+    /**
+     * C15's acceptance criterion names two things to grep for: the proxy password <b>and its Base64
+     * encoding</b>. The cleartext form was covered; the encoded one — which is what Basic actually puts on
+     * the wire, and what a host's HTTP debugging decorator dumps — was not.
+     */
+    @Test
+    void theBase64OfTheProxyPasswordNeverSurvivesEither() {
+        String base64 = Base64.getEncoder().encodeToString(
+                "corp-user:s3cr3t-proxy-pw".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        // Three shapes: the header the SDK sends, a bare credential in a message, and a proxy dump.
+        for (String message : List.of(
+                "Proxy-Authorization: Basic " + base64,
+                "handshake failed after offering Basic " + base64 + " to corp-gw",
+                "ProxyException: 407 from corp-gw; sent Basic " + base64)) {
+
+            String redacted = IngestResponse.failure(message).failureReason();
+
+            assertThat(redacted)
+                    .describedAs("Basic transmits the password merely Base64-encoded; once that string is "
+                            + "in a log or a support ticket the credential is compromised — message was: "
+                            + message)
+                    .doesNotContain(base64);
+            assertThat(redacted).contains("[Filtered]");
+        }
+    }
+
+    @Test
+    void redactionLeavesOrdinaryTextAlone() {
+        String ordinary = IngestResponse.failure(
+                "ConnectException: Connection refused to app.anvil-coder.tech:443").failureReason();
+
+        assertThat(ordinary)
+                .describedAs("a redactor that eats the diagnosis is a redactor nobody can debug behind")
+                .isEqualTo("ConnectException: Connection refused to app.anvil-coder.tech:443");
     }
 
     @Test

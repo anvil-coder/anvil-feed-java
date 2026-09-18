@@ -28,6 +28,16 @@ public record IngestResponse(int status, String body, Integer retryAfterSeconds,
     private static final Pattern INGEST_TOKEN = Pattern.compile("anv_(srv|pub)_[A-Za-z0-9]+");
     /** A proxy URL's Basic credentials: {@code http://user:secret@proxy:3128} (C15, X11). */
     private static final Pattern URL_USERINFO = Pattern.compile("(//)[^/@\\s]+:[^/@\\s]*@");
+    /**
+     * C15's Prüfkriterium names two things to grep for: the proxy password <b>and its Base64 encoding</b>.
+     * Basic transmits the password merely Base64-encoded, so a bare {@code Basic dXNlcjpwdw==} in an
+     * exception message — the shape a host's HTTP debugging decorator produces, which is the exact threat
+     * {@link #failure(String)} exists for — IS the credential, not a hint of one. It needs its own
+     * pattern: only {@code Proxy-Authorization: Basic …} was covered before, and then only by the accident
+     * that {@code Proxy-Authorization} contains the substring {@code Authorization}.
+     */
+    private static final Pattern BASIC_CREDENTIAL =
+            Pattern.compile("(?i)\\bBasic\\s+[A-Za-z0-9+/]{8,}={0,2}");
 
     public IngestResponse {
         body = body == null ? "" : body;
@@ -62,6 +72,9 @@ public record IngestResponse(int status, String body, Integer retryAfterSeconds,
         }
         String redacted = URL_USERINFO.matcher(text).replaceAll("$1[Filtered]@");
         redacted = INGEST_TOKEN.matcher(redacted).replaceAll("anv_$1_[Filtered]");
+        // Before AUTHORIZATION, which swallows the rest of the line: a Basic credential that is NOT on an
+        // Authorization line has to be caught on its own.
+        redacted = BASIC_CREDENTIAL.matcher(redacted).replaceAll("Basic [Filtered]");
         return AUTHORIZATION.matcher(redacted).replaceAll("Authorization: [Filtered]");
     }
 }

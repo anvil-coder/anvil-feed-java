@@ -854,4 +854,196 @@ class SenderTest {
 
         assertThat(parsed.path("rejected").path(0).path("reason_code").asText()).isEqualTo("no_binding");
     }
+
+    // ------------------------------------------------------------------ C16: the 407 is the proxy's
+
+    @Test
+    void a407IsTheProxysAnswerAndKeepsTheEventsQueued() {
+        EventQueue queue = queue();
+        queue.push(event(id(1)));
+        RecordingTransport transport = new RecordingTransport(
+                new IngestResponse(407, "", null, false, "the proxy corp-gw.internal:3128", null));
+
+        Sender sender = sender(queue, transport);
+        sender.flush();
+
+        assertThat(queue.size())
+                .describedAs("a proxy whose credentials are fixed five minutes later must lose nothing — "
+                        + "this is the environment C11/C15 exist for")
+                .isEqualTo(1);
+        assertThat(sender.isStopped()).isFalse();
+        assertThat(sender.pausedUntilMillis())
+                .describedAs("backed off like any transport failure, not dropped and not paused for ever")
+                .isBetween(now + 800L, now + 1200L);
+
+        List<String> said = written.matching("PROXY refused");
+        assertThat(said).describedAs("the explanation is said once per process; the per-attempt backoff line beside it is not that explanation").hasSize(1);
+        assertThat(said.get(0))
+                .describedAs("C16: the operator must be sent to the PROXY, not to the Anvil token")
+                .contains("corp-gw.internal:3128")
+                .contains("PROXY refused")
+                .contains("not the Anvil ingest")
+                .contains("jdk.http.auth.tunneling.disabledSchemes");
+        // The general statement, rather than a list of shapes to remember: nothing in this line looks
+        // like a credential to the SDK's own redactor, so redacting it changes nothing.
+        assertThat(IngestResponse.redact(said.get(0)))
+                .describedAs("C15/X11: the line an operator actually reads carries no credential, in "
+                        + "cleartext or in Base64")
+                .isEqualTo(said.get(0));
+    }
+
+    @Test
+    void a407IsNeverReportedAsAnUnexpectedStatus() {
+        EventQueue queue = queue();
+        queue.push(event(id(1)));
+        RecordingTransport transport = new RecordingTransport(IngestResponse.of(407, "", null));
+
+        sender(queue, transport).flush();
+
+        assertThat(written.matching("unexpected"))
+                .describedAs("the generic 4xx row drops the batch and then drops every later event in "
+                        + "silence — the one outcome C16 forbids")
+                .isEmpty();
+        assertThat(queue.size()).isEqualTo(1);
+        assertThat(written.matching("the configured proxy"))
+                .describedAs("a transport that cannot name the proxy still says it was a proxy")
+                .isNotEmpty();
+    }
+
+    // ------------------------------------------------------------------ FR-2 (c): the bound on the call
+
+    /**
+     * The deadline has to cover the wait for the lock, not only the work behind it. Task 10's adapter is
+     * told it may call {@code flushWithin(500)} after a response while the daemon pump is inside its own
+     * {@code flushWithin(2000)} on the next line of this class.
+     */
+    @Test
+    void aFlushThatCannotGetInsideTheBudgetGivesUpWithinIt() throws Exception {
+        EventQueue queue = queue();
+        queue.push(event(id(1)));
+        CountDownLatch holding = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // A transport that parks inside the flush, so the lock is genuinely held by somebody else.
+        Transport slow = (url, body, timeoutMs) -> {
+            holding.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return IngestResponse.of(202, RecordingTransport.acceptEverything(body), null);
+        };
+        Sender sender = new Sender(config(), queue, slow, written.logger(), System::currentTimeMillis);
+
+        Thread holder = new Thread(() -> sender.flushWithin(10_000));
+        holder.setDaemon(true);
+        holder.start();
+        assertThat(holding.await(10, TimeUnit.SECONDS)).isTrue();
+
+        long startedAt = System.nanoTime();
+        boolean gotIn = sender.flushWithin(100);
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+        release.countDown();
+        holder.join(10_000);
+
+        // The BOUND first, the flag second. A build that returns false after waiting out the other
+        // thread would otherwise pass the assertion whose name anybody reads.
+        assertThat(elapsedMs)
+                .describedAs("FR-2 (c) is a bound on the CALL — a 100 ms budget may not become the "
+                        + "pump's full request_timeout_ms plus 100 ms")
+                .isLessThan(1_000L);
+        assertThat(gotIn)
+                .describedAs("a flush that could not get in says so; the next turn does it anyway")
+                .isFalse();
+    }
+
+    @Test
+    void noRequestIsIssuedBelowTheMinimumBudgetAndNoBackoffIsArmed() {
+        EventQueue queue = queue();
+        queue.push(event(id(1)));
+        queue.push(event(id(2)));
+        List<Integer> budgets = new ArrayList<>();
+        // The first request eats all but 30 ms of the 2 s flush.
+        Transport slow = (url, body, timeoutMs) -> {
+            budgets.add(timeoutMs);
+            advance(1_970L);
+            return IngestResponse.of(202, RecordingTransport.acceptEverything(body), null);
+        };
+
+        Sender sender = sender(queue, slow, config(builder -> builder.batchSize(1)));
+        sender.flush();
+
+        assertThat(budgets)
+                .describedAs("30 ms is below the documented floor of " + Sender.MINIMUM_REQUEST_BUDGET_MS
+                        + " ms: the second request is NOT attempted")
+                .containsExactly(2000);
+        assertThat(queue.size())
+                .describedAs("and the batch it would have carried is back in the queue, not lost")
+                .isEqualTo(1);
+        assertThat(sender.pausedUntilMillis())
+                .describedAs("not attempted is not failed: a doomed 1 ms request would arm a ~1 s backoff "
+                        + "at the end of EVERY flush that drains a deep queue, and the log would blame "
+                        + "the network")
+                .isZero();
+        assertThat(written.matching("transport failure")).isEmpty();
+    }
+
+    // ------------------------------------------------------------------ the shutdown hook
+
+    @Test
+    void everyStartedSenderRemovesItsShutdownHookOnClose() {
+        int before = Sender.REGISTERED_SHUTDOWN_HOOKS.get();
+
+        for (int i = 0; i < 100; i++) {
+            Sender sender = new Sender(config(builder -> builder.flushIntervalMs(3_600_000)), queue(),
+                    new RecordingTransport(), written.logger(), () -> now);
+            sender.start();
+            sender.close();
+        }
+
+        assertThat(Sender.REGISTERED_SHUTDOWN_HOOKS.get())
+                .describedAs("Runtime cannot be asked what it holds, so a hundred cycles of a Spring "
+                        + "context refresh would otherwise accumulate a hundred hooks and a hundred "
+                        + "retained senders with nothing to notice it")
+                .isEqualTo(before);
+    }
+
+    @Test
+    void aSenderThatWasNeverStartedRegistersNoHookAtAll() {
+        int before = Sender.REGISTERED_SHUTDOWN_HOOKS.get();
+
+        for (int i = 0; i < 100; i++) {
+            new Sender(config(), queue(), new RecordingTransport(), written.logger(), () -> now).close();
+        }
+
+        assertThat(Sender.REGISTERED_SHUTDOWN_HOOKS.get()).isEqualTo(before);
+    }
+
+    // ------------------------------------------------------------------ the log flood
+
+    @Test
+    void aPersistentlyRewritten202IsSaidOnceInFullAndThenCounted() {
+        EventQueue queue = queue();
+        for (int i = 0; i < 6; i++) {
+            queue.push(event(id(i)));
+        }
+        // A proxy that strips the body: every answer is a 202 that names nothing, for ever.
+        String empty = "{\"accepted\":[],\"rejected\":[]}";
+        IngestResponse[] stripped = new IngestResponse[40];
+        java.util.Arrays.fill(stripped, IngestResponse.of(202, empty, null));
+        RecordingTransport transport = new RecordingTransport(stripped);
+
+        sender(queue, transport, config(builder -> builder.batchSize(1))).flush();
+
+        assertThat(written.matching("twice without naming it"))
+                .describedAs("said in FULL once — the id is the useful part and a reader needs one — and "
+                        + "not once per event: 500 events a minute would be 500 warnings a minute in the "
+                        + "log this class is everywhere else careful not to flood")
+                .hasSize(1);
+        assertThat(written.matching("further event(s) dropped in this flush"))
+                .describedAs("the rest are counted, and the count is said")
+                .hasSize(1);
+        assertThat(queue.size()).isZero();
+    }
 }

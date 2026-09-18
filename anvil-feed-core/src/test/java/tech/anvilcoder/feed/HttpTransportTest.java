@@ -164,7 +164,8 @@ class HttpTransportTest {
      */
     @Test
     void aServerThatDribblesIsCutOffAtTheBudgetRatherThanHeldOpen() throws Exception {
-        try (LocalIngest ingest = new LocalIngest(LocalIngest.dribbling(100));
+        LocalIngest.Dribble dribble = LocalIngest.dribbling(100);
+        try (LocalIngest ingest = new LocalIngest(dribble);
              HttpTransport transport = new HttpTransport(config(ingest.endpoint(), 400, 300))) {
 
             long startedAt = System.nanoTime();
@@ -177,6 +178,84 @@ class HttpTransportTest {
             assertThat(elapsedMs)
                     .describedAs("a 400 ms budget against a server dribbling 4 KiB at 100 ms a byte")
                     .isLessThan(3_000L);
+
+            // The assertion elapsed time cannot make: the exchange was RELEASED, not merely returned
+            // from. Without it `cancel(true)` could weaken to `cancel(false)` — or the finally block
+            // could go — and a worker would read for 409 s behind every timed-out request with this
+            // suite still green.
+            assertThat(dribble.clientGone.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    .describedAs("the server's own write must fail: the connection is closed, not "
+                            + "abandoned with a reader still sitting on it")
+                    .isTrue();
+        }
+    }
+
+    /** C16: a 407 comes from the proxy. The transport hands the Sender the proxy's identity to say so. */
+    @Test
+    void a407NamesTheProxyItWasRoutedThroughAndNeverACredential() throws Exception {
+        LocalIngest.Answer challenge = (exchange, body) -> {
+            exchange.getResponseHeaders().add("Proxy-Authenticate", "Basic realm=\"corp\"");
+            exchange.sendResponseHeaders(407, -1);
+            exchange.close();
+        };
+        // No credentials in the environment, which is the unanswerable 407 the operator profile actually
+        // produces. With an Authenticator installed the JDK answers the challenge, retries, and — against
+        // a proxy that never relents — gives up with an IOException, so the Sender would never see a 407
+        // at all; that path is covered by ProxySupportTest's credentialed case.
+        try (LocalIngest proxy = LocalIngest.alwaysAnswering(challenge)) {
+            AnvilFeedConfig config = config("http://192.0.2.7:8080/api/feed", 4_000, 2_000);
+            try (HttpTransport transport = new HttpTransport(config,
+                    name -> "HTTP_PROXY".equals(name) ? proxy.url("") : null)) {
+
+                IngestResponse response = transport.post(config.eventsUrl(), BODY, null);
+
+                assertThat(response.status()).isEqualTo(407);
+                assertThat(response.failureReason())
+                        .describedAs("host and port — the routing only the transport knows, which is why "
+                                + "it travels on the response for the Sender's C16 line")
+                        .contains("the proxy")
+                        .contains("127.0.0.1");
+            }
+
+            // And the description of a CREDENTIALED proxy still carries host and port only (C15/X11).
+            try (HttpTransport credentialed = new HttpTransport(config,
+                    name -> "HTTP_PROXY".equals(name)
+                            ? "http://corp-user:s3cr3t-proxy-pw@" + proxy.url("").substring(7)
+                            : null)) {
+
+                String described = credentialed.describeProxyFor(config.eventsUrl());
+
+                assertThat(described).contains("127.0.0.1");
+                assertThat(described)
+                        .describedAs("never the credential, in either form")
+                        .doesNotContain("s3cr3t-proxy-pw")
+                        .doesNotContain("corp-user");
+            }
+        }
+    }
+
+    @Test
+    void theClientIsPinnedToHttp11AndItsWorkerIsANamedDaemon() throws Exception {
+        try (LocalIngest ingest = new LocalIngest();
+             HttpTransport transport = new HttpTransport(config(ingest.endpoint(), 2000, 1000))) {
+
+            transport.post(ingest.endpoint() + "/events", BODY, null);
+
+            assertThat(ingest.requests.get(0).protocol())
+                    .describedAs("the version the server actually saw")
+                    .isEqualTo("HTTP/1.1");
+            assertThat(ingest.requests.get(0).header("upgrade"))
+                    .describedAs("no `Upgrade: h2c` probe: the ingest is behind nginx and the hop before "
+                            + "it may be a corporate proxy, neither of which wins anything from HTTP/2 "
+                            + "for one small POST")
+                    .isNull();
+            assertThat(Thread.getAllStackTraces().keySet().stream()
+                    .filter(thread -> thread.getName().startsWith("anvil-feed-http-"))
+                    .toList())
+                    .describedAs("a bounded, named, daemon pool — not an anonymous cached one a reader "
+                            + "finds in a thread dump with no hint of who owns it")
+                    .isNotEmpty()
+                    .allSatisfy(thread -> assertThat(thread.isDaemon()).isTrue());
         }
     }
 

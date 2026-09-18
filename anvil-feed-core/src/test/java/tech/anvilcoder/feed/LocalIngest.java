@@ -34,7 +34,8 @@ final class LocalIngest implements AutoCloseable {
         void write(HttpExchange exchange, String requestBody) throws IOException;
     }
 
-    record Recorded(String method, String uri, String path, Map<String, String> headers, String body) {
+    record Recorded(String method, String uri, String path, String protocol,
+                    Map<String, String> headers, String body) {
 
         String header(String name) {
             return headers.get(name.toLowerCase(Locale.ROOT));
@@ -61,10 +62,19 @@ final class LocalIngest implements AutoCloseable {
         this.fallback = fallback;
         this.scripted.addAll(answers);
         this.server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        // Daemon threads. With the JDK's default (handlers run on the dispatcher thread, which is
+        // NOT a daemon) a dribbling handler that nobody cancelled held the whole test JVM open for
+        // its full 409 s after the suite had already finished and gone green.
+        this.server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+            Thread thread = new Thread(runnable, "local-ingest");
+            thread.setDaemon(true);
+            return thread;
+        }));
         this.server.createContext("/", exchange -> {
             String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             requests.add(new Recorded(exchange.getRequestMethod(), exchange.getRequestURI().toString(),
-                    exchange.getRequestURI().getPath(), lowerCasedHeaders(exchange), body));
+                    exchange.getRequestURI().getPath(), exchange.getProtocol(),
+                    lowerCasedHeaders(exchange), body));
             Answer answer = scripted.poll();
             (answer == null ? this.fallback : answer).write(exchange, body);
         });
@@ -103,15 +113,33 @@ final class LocalIngest implements AutoCloseable {
 
     /**
      * Headers, then one byte every {@code gapMillis} for ever. The sleep is the SERVER's — a slow
-     * counterparty is what is being simulated — and the assertion is the elapsed time the CLIENT took to
-     * give up, never a sleep in the test itself.
+     * counterparty is what is being simulated — and the assertion is what the client did, never a sleep
+     * in the test itself.
+     *
+     * <p>{@link Dribble#clientGone} is the point of it. Elapsed time proves only that {@code post()}
+     * RETURNED, not that the exchange was released: an edit that dropped the cancellation would leave a
+     * worker reading 4 KiB at {@code gapMillis} a byte — 409 s — behind every timed-out request, and
+     * every elapsed-time assertion would stay green. Observing the SERVER notice the close is the same
+     * move the redirect tests make, and the reason those are the strongest in the suite.
      */
-    static Answer dribbling(long gapMillis) {
-        return (exchange, requestBody) -> {
+    static final class Dribble implements Answer {
+
+        private final long gapMillis;
+
+        /** Counted down when a write fails because the client went away. */
+        final java.util.concurrent.CountDownLatch clientGone = new java.util.concurrent.CountDownLatch(1);
+
+        Dribble(long gapMillis) {
+            this.gapMillis = gapMillis;
+        }
+
+        @Override
+        public void write(HttpExchange exchange, String requestBody) throws IOException {
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(202, 4096);
+            long giveUpAt = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(20);
             try (OutputStream out = exchange.getResponseBody()) {
-                for (int i = 0; i < 4096; i++) {
+                for (int i = 0; i < 4096 && System.nanoTime() < giveUpAt; i++) {
                     out.write('x');
                     out.flush();
                     Thread.sleep(gapMillis);
@@ -120,8 +148,13 @@ final class LocalIngest implements AutoCloseable {
                 Thread.currentThread().interrupt();
             } catch (IOException clientGaveUp) {
                 // Which is the point of this answer.
+                clientGone.countDown();
             }
-        };
+        }
+    }
+
+    static Dribble dribbling(long gapMillis) {
+        return new Dribble(gapMillis);
     }
 
     /** Answers 413 to anything above {@code maxEvents} events and accepts everything else. */
