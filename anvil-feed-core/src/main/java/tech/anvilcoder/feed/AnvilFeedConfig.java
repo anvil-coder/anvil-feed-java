@@ -3,6 +3,7 @@ package tech.anvilcoder.feed;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
 /**
@@ -84,17 +85,31 @@ public record AnvilFeedConfig(
     }
 
     public static AnvilFeedConfig fromEnvironment(FeedLogger logger) {
+        return fromEnvironment(logger, System::getenv);
+    }
+
+    /**
+     * The same five names, read through an injectable lookup. Package-private and for one caller:
+     * {@code ConfigParityTest}, which pins the names — C17 is about identical names, and an environment
+     * variable is the one name a customer types by hand into a Helm values file, so a rename in one
+     * language and not the other costs them a whole service's error stream with nothing to see. A JVM
+     * cannot set its own environment, so a seam is the only way to assert them; this is the same shape
+     * {@code HttpTransport}'s package-private constructor already uses for the proxy variables.
+     *
+     * @param lookup answers a variable name with its value, or null
+     */
+    static AnvilFeedConfig fromEnvironment(FeedLogger logger, UnaryOperator<String> lookup) {
         return builder()
-                .endpoint(env("ANVIL_INGEST_ENDPOINT"))
-                .token(env("ANVIL_INGEST_TOKEN"))
-                .service(env("ANVIL_SERVICE"))
-                .environment(env("ANVIL_ENVIRONMENT"))
-                .release(env("ANVIL_RELEASE"))
+                .endpoint(env(lookup, "ANVIL_INGEST_ENDPOINT"))
+                .token(env(lookup, "ANVIL_INGEST_TOKEN"))
+                .service(env(lookup, "ANVIL_SERVICE"))
+                .environment(env(lookup, "ANVIL_ENVIRONMENT"))
+                .release(env(lookup, "ANVIL_RELEASE"))
                 .build(logger);
     }
 
-    private static String env(String name) {
-        String value = System.getenv(name);
+    private static String env(UnaryOperator<String> lookup, String name) {
+        String value = lookup.apply(name);
         return value == null || value.isBlank() ? null : value.trim();
     }
 

@@ -8,13 +8,16 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -85,9 +88,7 @@ class ConfigParityTest {
         actual.put("fingerprint_window_ms", config.fingerprintWindowMs());
         actual.put("ignored_request_paths", config.ignoredRequestPaths());
 
-        List<String> listed = new ArrayList<>();
-        expected.fieldNames().forEachRemaining(listed::add);
-        listed.remove("note");
+        List<String> listed = sharedListKeys();
 
         assertThat(actual.keySet())
                 .describedAs("a parameter in the shared list that this test does not read is a parameter "
@@ -100,6 +101,125 @@ class ConfigParityTest {
                     : wanted.isNumber() ? (Object) wanted.asInt() : wanted.asText();
             assertThat(entry.getValue()).describedAs(entry.getKey()).isEqualTo(value);
         }
+    }
+
+    /**
+     * The components of {@link AnvilFeedConfig} that deliberately have no entry in the shared list, each
+     * with the reason it has none. Adding a name here is how a knob LEAVES the parity contract, and it has
+     * to be a decision somebody wrote down rather than a silent omission. The four are the same four PHP's
+     * twin exempts, spelled the same way.
+     */
+    private static final Map<String, String> NOT_IN_THE_SHARED_LIST = Map.of(
+            "token", "no default: without it the SDK is switched off rather than guessing one",
+            "service", "no default: without it the SDK is switched off rather than guessing one",
+            "release", "no default: unset means \"read it from git or send none\"",
+            "enabled", "derived from the three above, not a value an operator sets on its own");
+
+    /**
+     * The other direction, and the one this test was missing: every component {@link AnvilFeedConfig}
+     * carries has to appear in the shared list, or in {@link #NOT_IN_THE_SHARED_LIST} with its reason.
+     *
+     * <p>Without it, {@code everyDefaultMatchesTheSharedList} catches only a key added to the FILE that no
+     * test reads. The direction that actually breaks C17 is the opposite one: a knob added to
+     * {@code AnvilFeedConfig} that never reaches {@code conformance/config-defaults.json} — Task 10's
+     * in-app-package property, say — leaves PHP unable to be configured the same way and nothing red. This
+     * fails on the day the knob is added rather than on the day somebody notices.
+     */
+    @Test
+    void everyKnobOfThisSdkIsNamedInTheSharedList() throws Exception {
+        List<String> knobs = Arrays.stream(AnvilFeedConfig.class.getRecordComponents())
+                .map(RecordComponent::getName)
+                .filter(name -> !NOT_IN_THE_SHARED_LIST.containsKey(name))
+                .map(ConfigParityTest::snakeCase)
+                .sorted()
+                .toList();
+
+        assertThat(knobs)
+                .describedAs("a knob this SDK has and conformance/config-defaults.json does not name is a "
+                        + "parameter the other language was never asked for — add it to the file and to "
+                        + "both parity tests, or to NOT_IN_THE_SHARED_LIST with the reason it has no "
+                        + "default")
+                .isEqualTo(sharedListKeys().stream().sorted().toList());
+    }
+
+    /** An exemption whose name is not a component at all is a stale exemption, and it hides a knob. */
+    @Test
+    void everyExemptionNamesAComponentThatReallyExists() {
+        List<String> components = Arrays.stream(AnvilFeedConfig.class.getRecordComponents())
+                .map(RecordComponent::getName).toList();
+
+        assertThat(components).containsAll(NOT_IN_THE_SHARED_LIST.keySet());
+        assertThat(NOT_IN_THE_SHARED_LIST.values())
+                .describedAs("an exemption without a reason is a silent omission with extra steps")
+                .allSatisfy(reason -> assertThat(reason).isNotBlank());
+    }
+
+    /** {@code maxQueueSize} is {@code max_queue_size}; the shared list is snake_case in both languages. */
+    private static String snakeCase(String camel) {
+        return camel.replaceAll("(?<!^)([A-Z])", "_$1").toLowerCase(Locale.ROOT);
+    }
+
+    private static List<String> sharedListKeys() throws Exception {
+        JsonNode file = JSON.readTree(Files.readString(CONFORMANCE.resolve("config-defaults.json")));
+        List<String> keys = new ArrayList<>();
+        file.fieldNames().forEachRemaining(keys::add);
+        keys.remove("note");
+        return keys;
+    }
+
+    // ================================================================= the environment variables
+
+    /**
+     * The five names both languages read, pinned by the set of names the lookup is ASKED for as well as by
+     * the values that come back. C17 is about identical names, and an environment variable is the one name
+     * a customer types by hand — into a Helm values file, a systemd unit, a Dockerfile. A rename in one
+     * language costs them that service's whole error stream with nothing to see, and
+     * {@code config-defaults.json} names none of them, so this test is the only place either language is
+     * held to them.
+     *
+     * <p>PHP pins the same five with {@code putenv}. A JVM cannot set its own environment, which is why
+     * {@link AnvilFeedConfig#fromEnvironment(FeedLogger, java.util.function.UnaryOperator)} exists.
+     */
+    @Test
+    void theFiveEnvironmentVariableNamesAreTheOnesPhpReads() {
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put("ANVIL_INGEST_ENDPOINT", "https://ingest.example/api/feed");
+        environment.put("ANVIL_INGEST_TOKEN", "anv_srv_0123456789abcdef0123456789abcdef");
+        environment.put("ANVIL_SERVICE", "shop-api");
+        environment.put("ANVIL_ENVIRONMENT", "staging");
+        environment.put("ANVIL_RELEASE", "v1.2.3");
+
+        List<String> asked = new ArrayList<>();
+        AnvilFeedConfig config = AnvilFeedConfig.fromEnvironment(FeedLogger.toSystemLogger(), name -> {
+            asked.add(name);
+            return environment.get(name);
+        });
+
+        assertThat(asked)
+                .describedAs("the SDK read a variable the shared contract does not name, or stopped "
+                        + "reading one it does")
+                .containsExactlyInAnyOrderElementsOf(environment.keySet());
+        assertThat(config.endpoint()).isEqualTo("https://ingest.example/api/feed");
+        assertThat(config.token()).isEqualTo("anv_srv_0123456789abcdef0123456789abcdef");
+        assertThat(config.service()).isEqualTo("shop-api");
+        assertThat(config.environment()).isEqualTo("staging");
+        assertThat(config.release()).isEqualTo("v1.2.3");
+        assertThat(config.enabled())
+                .describedAs("the five alone must be enough to switch the SDK on")
+                .isTrue();
+    }
+
+    /** An empty variable is unset, not a configured empty string — in both languages. */
+    @Test
+    void anEmptyEnvironmentVariableCountsAsUnset() {
+        AnvilFeedConfig config = AnvilFeedConfig.fromEnvironment(FeedLogger.toSystemLogger(),
+                name -> "ANVIL_SERVICE".equals(name) ? "shop-api"
+                        : "ANVIL_INGEST_TOKEN".equals(name) ? "anv_srv_0123456789abcdef0123456789abcdef"
+                        : "   ");
+
+        assertThat(config.endpoint()).isEqualTo(AnvilFeedConfig.DEFAULT_ENDPOINT);
+        assertThat(config.environment()).isEqualTo("production");
+        assertThat(config.release()).isNull();
     }
 
     private static List<String> strings(JsonNode array) {
@@ -252,6 +372,18 @@ class ConfigParityTest {
                 Arguments.of(404L, 404),
                 Arguments.of(BigInteger.valueOf(404), 404),
                 Arguments.of((short) 404, 404),
+                Arguments.of(Integer.MAX_VALUE, Integer.MAX_VALUE),
+                Arguments.of(Integer.MIN_VALUE, Integer.MIN_VALUE),
+
+                // Out of a signed 32-bit int: DROPPED, never wrapped. intValue() made 5000000000 into
+                // 705032704 and sent it, which is the same defect the float rows below were fixed for.
+                Arguments.of(5_000_000_000L, null),
+                Arguments.of(-5_000_000_000L, null),
+                Arguments.of(new BigInteger("99999999999"), null),
+                Arguments.of(new BigDecimal("3000000000"), null),
+                Arguments.of("3000000000", null),
+                Arguments.of("99999999999999999999999", null),
+                Arguments.of(3.0e9d, null),
 
                 Arguments.of(200.0d, 200),
                 Arguments.of(200.0f, 200),

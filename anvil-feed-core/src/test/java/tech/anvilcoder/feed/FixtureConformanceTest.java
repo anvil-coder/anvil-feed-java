@@ -13,10 +13,12 @@ import shop.ConformanceCaller;
 import shop.SecretHolder;
 
 import java.io.InputStream;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -530,6 +532,32 @@ class FixtureConformanceTest {
                     ConformanceCaller.report("hooked identity", "warning", Map.of());
                 }));
 
+        // The delivery key REMOVED rather than replaced — a different input from the hook below, which
+        // replaces it with a ULID (rejected/bad-event-id.json). It reaches withReadOnlyFieldsRestored's
+        // put-back arm, and with that arm gone this entry emits NOTHING, which is what
+        // everyEventOfTheHostileCorpusIsItselfSchemaValid catches. The fixture for the absent case,
+        // rejected/missing-event-id.json, is on NOT_PRODUCIBLE_BY_ANY_INPUT for exactly that reason.
+        corpus.add(new Hostile("a beforeSend hook that removes the delivery key", config(),
+                client -> {
+                    client.beforeSend(payload -> {
+                        payload.remove("event_id");
+                        return payload;
+                    });
+                    ConformanceCaller.report("no delivery key", "warning", Map.of());
+                }));
+
+        // Thirteen fractional digits. java.time.Instant.parse accepts at most nine, so
+        // rejected/bad-timestamp-too-precise.json is a DIFFERENT refusal from the impossible date the
+        // identity hook writes, and it had no input of its own.
+        corpus.add(new Hostile("a beforeSend hook that writes a timestamp no Instant can parse", config(),
+                client -> {
+                    client.beforeSend(payload -> {
+                        payload.put("timestamp", "2026-01-01T10:11:12.1234567890123Z");
+                        return payload;
+                    });
+                    ConformanceCaller.report("thirteen fractional digits", "warning", Map.of());
+                }));
+
         corpus.add(new Hostile("a beforeSend hook that adds secrets and a thirtieth tag", config(),
                 client -> {
                     client.beforeSend(payload -> {
@@ -614,6 +642,77 @@ class FixtureConformanceTest {
                         .isFalse();
             }
         }
+    }
+
+    /**
+     * The two refused shapes no public-API input can produce, and the test that covers each instead.
+     * {@code conformance/README.md} carries the same list, for both languages, with the reason — and
+     * {@link #theDocumentedNotProducibleListIsExact()} holds the two copies to each other, so a fixture
+     * quietly moved onto the list fails rather than going quiet.
+     *
+     * <p>Both are REQUIRED members this SDK fills itself and a hook can only remove. Two guards stand
+     * between a hook and the wire — the read-only restore, and then the "does the ingest require this?"
+     * check — and the second one DROPS the event rather than emitting the shape. So the only observable
+     * outcome is no event at all, and no predicate over emitted events can ever be true of these two.
+     * Red proof 3 of the fix round is the evidence: with the restore removed, the delivery-key entry
+     * emits nothing and {@code everyEventOfTheHostileCorpusIsItselfSchemaValid} is what reddens.
+     */
+    private static final Map<String, String> NOT_PRODUCIBLE_BY_ANY_INPUT = Map.of(
+            "rejected/missing-event-id.json", "anEventAHookStrippedTheDeliveryKeyFromKeepsIt",
+            "sdk-forbidden/missing-language.json", "anEventAHookMadeUnsendableIsDroppedWithOneLine");
+
+    /**
+     * The list in {@code conformance/README.md} and the list above must be the same list, every file on
+     * it must really be a refused fixture, and every test named as covering one must really exist. Prose
+     * that names a test nobody kept is how an exemption outlives the thing that justified it.
+     */
+    @Test
+    void theDocumentedNotProducibleListIsExact() throws Exception {
+        String readme = Files.readString(CONFORMANCE.resolve("README.md"));
+        int start = readme.indexOf("```not-producible");
+        assertThat(start)
+                .describedAs("conformance/README.md must carry a ```not-producible block; it is the "
+                        + "language-independent half of this exemption")
+                .isNotNegative();
+        String block = readme.substring(readme.indexOf('\n', start) + 1, readme.indexOf("```", start + 3));
+        List<String> documented = block.lines().map(String::trim).filter(line -> !line.isEmpty())
+                .sorted().toList();
+
+        assertThat(documented)
+                .describedAs("the README's list and this file's list have drifted apart")
+                .isEqualTo(NOT_PRODUCIBLE_BY_ANY_INPUT.keySet().stream().sorted().toList());
+        assertThat(refusedShapes().map(Refusal::file).toList())
+                .describedAs("a file on the not-producible list that is not a refused fixture at all")
+                .containsAll(documented);
+
+        List<String> ourTests = Arrays.stream(FixtureConformanceTest.class.getDeclaredMethods())
+                .map(Method::getName).toList();
+        assertThat(ourTests)
+                .describedAs("a covering test named in the exemption does not exist any more")
+                .containsAll(NOT_PRODUCIBLE_BY_ANY_INPUT.values());
+    }
+
+    /**
+     * The delivery key is restored, not dropped: a hook that removes {@code event_id} costs the hook's
+     * change, never the event, and the id on the wire is the one the caller was handed. This is what
+     * covers {@code rejected/missing-event-id.json}; see {@link #NOT_PRODUCIBLE_BY_ANY_INPUT}.
+     */
+    @Test
+    void anEventAHookStrippedTheDeliveryKeyFromKeepsIt() {
+        List<String> handedOut = new ArrayList<>();
+        List<Map<String, Object>> sent = onTheWire(config(), client -> {
+            client.beforeSend(payload -> {
+                payload.remove("event_id");
+                return payload;
+            });
+            handedOut.add(ConformanceCaller.report("no delivery key", "warning", Map.of()));
+        });
+
+        assertThat(sent).describedAs("the event is sent, not dropped").hasSize(1);
+        assertThat(sent.get(0).get("event_id"))
+                .describedAs("Sender matches the ingest's verdicts on this id; a body naming another one "
+                        + "is retried once and then dropped, blaming the network for what host code did")
+                .isEqualTo(handedOut.get(0));
     }
 
     /** A fixture added to the index without a predicate here fails the run instead of being uncovered. */
@@ -725,6 +824,55 @@ class FixtureConformanceTest {
         for (String secret : PLANTED_SECRETS) {
             assertThat(wire).describedAs("a planted secret survived: %s", secret).doesNotContain(secret);
         }
+    }
+
+    /**
+     * The guard on the list above. The five top-level members it compares are not a hand-picked set: they
+     * are DERIVED from the two fixtures — every top-level member whose value differs between
+     * {@code pii/raw.json} and {@code pii/expected.json}. A future {@code expected.json} that redacts a
+     * sixth member would otherwise be held by {@link ScrubberTest} alone and be silently uncovered through
+     * the public API, which is exactly the split {@code conformance/README.md}'s {@code pii/} row says must
+     * not reopen.
+     *
+     * <p>Inside {@code exception} the same derivation runs one level down, and it has ONE named exemption:
+     * {@code stacktrace}. A Java stack cannot carry {@code app/Auth.php}, so the frame's
+     * {@code context_code} rule is proved against a file written for it
+     * ({@link #contextCodeIsScrubbedBeforeItLeavesTheProcess()}) instead of against a PHP frame.
+     */
+    @Test
+    void theComparedMembersAreTheMembersThatDiffer() throws Exception {
+        Map<String, Object> raw = fixture("pii/raw.json");
+        Map<String, Object> expected = fixture("pii/expected.json");
+
+        assertThat(differingKeys(raw, expected))
+                .describedAs("the scrubber's own contract changed shape: theScrubberContractHoldsThrough"
+                        + "ThePublicCaptureApi compares exactly these five and has to be extended")
+                .isEqualTo(COMPARED_TOP_LEVEL);
+
+        assertThat(differingKeys(map(raw.get("exception")), map(expected.get("exception"))))
+                .describedAs("inside exception the pair redacts the message and the frame's context_code; "
+                        + "stacktrace is exempted by name, for the reason in this test's javadoc")
+                .isEqualTo(List.of("message", "stacktrace"));
+    }
+
+    /** The five members the public-API claim compares, in the order it compares them. */
+    private static final List<String> COMPARED_TOP_LEVEL =
+            List.of("exception", "request", "user", "breadcrumbs", "tags");
+
+    /** Every key present in either map whose value is not equal in both, in the first map's order. */
+    private static List<String> differingKeys(Map<String, Object> one, Map<String, Object> other) {
+        List<String> differing = new ArrayList<>();
+        for (String key : one.keySet()) {
+            if (!java.util.Objects.equals(one.get(key), other.get(key))) {
+                differing.add(key);
+            }
+        }
+        for (String key : other.keySet()) {
+            if (!one.containsKey(key)) {
+                differing.add(key);
+            }
+        }
+        return differing;
     }
 
     /**

@@ -8,7 +8,9 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -31,11 +33,20 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *       reddens, with the remedy in the message. That is deliberate: re-reading a 191-line file after a
  *       server change is cheap, and deciding from a digest that the change "was only a comment" is exactly
  *       the judgement this guard exists to take away from a hurried reader;</li>
- *   <li>every string literal and every numeric constant of the upstream appears in the copy. This one
- *       survives the four mechanical edits the copy's own header documents, so it says something sharper
- *       than the digest: the separator, the version tag {@code incident-fingerprint/v1}, the shape tags,
- *       the frame cap and every path-normalisation pattern are still the server's.</li>
+ *   <li>every string literal of the upstream appears in the copy, and every NAMED numeric constant is
+ *       found in the copy's own DECLARATION of that name ({@code TOP_FRAMES = 3}, not "the digit 3 occurs
+ *       somewhere"). This one survives the four mechanical edits the copy's own header documents, so it
+ *       says something the digest cannot say about a copy that was re-taken by hand: the separator, the
+ *       version tag {@code incident-fingerprint/v1}, the shape tags, the frame cap and every
+ *       path-normalisation pattern are still the server's.</li>
  * </ol>
+ *
+ * <p>What the second assertion does NOT catch, stated plainly because a reader will otherwise trust the
+ * list above: a semantic change that keeps every literal and every constant — reordering the pre-hash
+ * components, taking the LAST three frames instead of the first, dropping the in-app promotion. Only the
+ * digest sees those, and it sees them because it sees every byte. The chain holds because the documented
+ * remedy is "re-copy, then move the pin, in one commit", after which {@link FingerprintTest}'s ten
+ * thousand generated comparisons run against the NEW copy.
  *
  * <p><b>Skipped or failed, never quietly passed.</b> Without {@code -Danvilfeed.incidents.worktree} the
  * checkout is simply not on this machine and the test SKIPS, naming the property. WITH the property it is
@@ -115,16 +126,24 @@ class FingerprintOracleFreshnessTest {
                 .isEqualTo(PINNED_UPSTREAM_SHA256);
 
         String copy = Files.readString(COPY);
-        for (String constant : constantsOf(upstream)) {
+        for (String literal : constantsOf(upstream)) {
             assertThat(copy)
-                    .describedAs("a constant of the server's rule is not in the oracle any more: %s",
-                            constant)
-                    .contains(constant);
+                    .describedAs("a string literal of the server's rule is not in the oracle any more: %s",
+                            literal)
+                    .contains(literal);
         }
+
+        String copyCode = commentFreeCode(copy);
+        namedNumbersOf(upstream).forEach((name, value) -> assertThat(copyCode)
+                .describedAs("the server declares %s = %s and the oracle does not — checked in its "
+                        + "DECLARATION, because \"the copy contains the digit 3 somewhere\" is true of "
+                        + "almost any Java file", name, value)
+                .containsPattern("\\b" + Pattern.quote(name) + "\\s*=\\s*"
+                        + Pattern.quote(value) + "\\s*;"));
     }
 
     /**
-     * Every string literal and every integer constant of the upstream source, found with a scanner rather
+     * Every string literal of the upstream source, found with a scanner rather
      * than with a regex over the whole file. A regex is what a first draft reached for and it was wrong in
      * a way that matters here: stripping {@code //} comments first cuts a URL scheme regex
      * ({@code "^[A-Za-z][A-Za-z0-9+.-]*://"}) in half, and the literal that comes back is then a fragment
@@ -203,16 +222,89 @@ class FingerprintOracleFreshnessTest {
             code.append(c);
         }
 
-        List<String> constants = new ArrayList<>(literals);
-        Matcher numbers = Pattern.compile("=\\s*(\\d+)\\s*;").matcher(code);
-        while (numbers.find()) {
-            constants.add(numbers.group(1));
-        }
         // A rule with no literals at all would make the assertion above vacuous, and the version tag and
         // the separator are both literals — so the count is a floor, not a formality.
-        assertThat(constants)
-                .describedAs("the upstream file parsed to almost no constants; the scanner is broken")
+        assertThat(literals)
+                .describedAs("the upstream file parsed to almost no literals; the scanner is broken")
                 .hasSizeGreaterThanOrEqualTo(8);
-        return constants;
+        return literals;
+    }
+
+    /**
+     * Every NAMED numeric constant of the upstream, as {@code name -> value}. It exists because the first
+     * version of this check extracted the numbers as bare digit strings and asserted
+     * {@code copy.contains("3")} — a substring that occurs in essentially any Java file, so
+     * {@code TOP_FRAMES} and {@code VERSION} could not fail however far they drifted, while the class
+     * javadoc claimed the frame cap was covered. A constant is only checked here if it is checked in its
+     * DECLARATION.
+     */
+    private static Map<String, String> namedNumbersOf(String source) {
+        Map<String, String> numbers = new LinkedHashMap<>();
+        Matcher declarations = Pattern.compile(
+                "\\b([A-Z][A-Z0-9_]*)\\s*=\\s*(-?\\d+)\\s*;").matcher(commentFreeCode(source));
+        while (declarations.find()) {
+            numbers.put(declarations.group(1), declarations.group(2));
+        }
+        assertThat(numbers)
+                .describedAs("the upstream declares no named numeric constant at all; either the rule "
+                        + "changed shape or this extraction is broken")
+                .containsKeys("VERSION", "TOP_FRAMES");
+        return numbers;
+    }
+
+    /** The source with comments removed, so prose the copy deliberately replaced is not read as code. */
+    private static String commentFreeCode(String source) {
+        StringBuilder code = new StringBuilder();
+        boolean inString = false;
+        boolean inChar = false;
+        boolean inLineComment = false;
+        boolean inBlockComment = false;
+        for (int i = 0; i < source.length(); i++) {
+            char c = source.charAt(i);
+            char next = i + 1 < source.length() ? source.charAt(i + 1) : '\0';
+            if (inLineComment) {
+                if (c == '\n') {
+                    inLineComment = false;
+                    code.append(c);
+                }
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (inString || inChar) {
+                if (c == '\\') {
+                    i++;
+                } else if ((inString && c == '"') || (inChar && c == '\'')) {
+                    inString = false;
+                    inChar = false;
+                }
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (c == '/' && next == '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                continue;
+            }
+            code.append(c);
+        }
+        return code.toString();
     }
 }

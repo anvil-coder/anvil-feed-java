@@ -542,40 +542,68 @@ public final class EventFactory {
     /**
      * @return the status as the schema's {@code integer}, or {@code null} when it is not one.
      *
-     * <p>A FLOATING-POINT value is only a status code when it IS an integer: {@code 200.0} is the 200 a
-     * JSON or properties hop turned into a double, and {@code 200.5} is not a status at all.
-     * {@code intValue()} alone truncated every one of them — {@code 200.5} became 200, {@code -0.5} and
-     * {@code NaN} became 0, and {@code Infinity} became 2147483647, each of them shown in a cockpit as a
-     * fact the caller never stated. Dropping is the same answer the string branch below gives to
-     * {@code "200.5"}, and the same one PHP's {@code asInteger} gives (task-9 parity list).
+     * <p>Two rules, and every arm below shares both. <b>Integrality</b>: a floating-point value is only a
+     * status code when it IS a whole number — {@code 200.0} is the 200 a JSON or properties hop turned into
+     * a double, and {@code 200.5} is not a status at all. <b>Range</b>: a whole number outside a signed
+     * 32-bit int is not one either, and it is DROPPED rather than wrapped.
+     *
+     * <p>Both rules exist because the same defect was found twice. {@code intValue()} alone truncated
+     * {@code 200.5} to 200, {@code NaN} to 0 and {@code Infinity} to 2147483647; then, with the float arm
+     * bounded, the remaining {@code Number} arm still turned a {@code Long} of 5000000000 into 705032704.
+     * Each of those is a status nobody sent, shown in a cockpit as a fact the caller never stated. The
+     * string arm has always dropped an out-of-range value ({@code Integer.valueOf} throws), so the shared
+     * {@link #withinAnInt(long)} below is what makes the other arms give the same answer rather than a
+     * differently-shaped one.
+     *
+     * <p>PHP's {@code asInteger} bounds its float branch at {@code PHP_INT_MIN/MAX}, which is 64-bit; its
+     * integer and string branches are unbounded. The 32-bit bound is the one schema 1.0's readers actually
+     * have, and it is on the task-9 parity list for PHP to adopt.
      */
     private static Integer asInteger(Object value) {
         if (value instanceof Double || value instanceof Float) {
             double asDouble = ((Number) value).doubleValue();
-            return Double.isFinite(asDouble) && asDouble == Math.rint(asDouble)
-                    && asDouble >= Integer.MIN_VALUE && asDouble <= Integer.MAX_VALUE
-                    ? Integer.valueOf((int) asDouble) : null;
+            if (!Double.isFinite(asDouble) || asDouble != Math.rint(asDouble)) {
+                return null;
+            }
+            // (long) saturates at Long.MIN/MAX for a value that large, which withinAnInt then drops.
+            return withinAnInt((long) asDouble);
         }
         if (value instanceof java.math.BigDecimal decimal) {
             try {
-                return decimal.intValueExact();
-            } catch (ArithmeticException notAWholeNumber) {
+                return withinAnInt(decimal.longValueExact());
+            } catch (ArithmeticException notAWholeNumberOrTooLarge) {
+                return null;
+            }
+        }
+        if (value instanceof java.math.BigInteger big) {
+            try {
+                return withinAnInt(big.longValueExact());
+            } catch (ArithmeticException tooLarge) {
                 return null;
             }
         }
         if (value instanceof Number number) {
-            return number.intValue();
+            return withinAnInt(number.longValue());
         }
         if (value instanceof String text && INTEGER.matcher(text.trim()).matches()) {
             try {
-                return Integer.valueOf(text.trim());
-            } catch (NumberFormatException tooLarge) {
+                return withinAnInt(Long.parseLong(text.trim()));
+            } catch (NumberFormatException moreDigitsThanALongHolds) {
                 return null;
             }
         }
         // Dropped rather than shipped: a status the SDK cannot read is one member of an optional block,
         // and sending it as a string would cost the whole event.
         return null;
+    }
+
+    /**
+     * The ONE 32-bit bound every arm of {@link #asInteger} shares. Out of range is dropped, never wrapped:
+     * a status the caller never stated is worse than an absent optional field, and the field IS optional.
+     */
+    private static Integer withinAnInt(long value) {
+        return value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE
+                ? Integer.valueOf((int) value) : null;
     }
 
     private static String title(String type, String message) {

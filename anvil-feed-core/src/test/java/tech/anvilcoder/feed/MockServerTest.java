@@ -200,6 +200,14 @@ class MockServerTest {
                         .describedAs("%s: the verdict is final — nothing of this batch is sent again",
                                 entry.scenario())
                         .isZero();
+                // Measured by REQUEST COUNT, not only by an empty queue: a sender that retried a 400
+                // three times and then gave up leaves exactly the same queue behind. One batch in, one
+                // request out — the 413 included, because a single event that is still too large has
+                // nothing left to split and is dropped by id on the first answer.
+                assertThat(run.requests())
+                        .describedAs("%s: a final verdict is not retried — this is the assertion an "
+                                + "empty queue cannot make", entry.scenario())
+                        .hasSize(1);
                 assertThat(run.pausedUntil())
                         .describedAs("%s: a final verdict is not a reason to stop sending anything else",
                                 entry.scenario())
