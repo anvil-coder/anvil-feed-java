@@ -27,7 +27,7 @@ class AnvilFeedConfigTest {
     }
 
     /**
-     * C17's Prüfkriterium is that there is exactly ONE table. It lives in
+     * C17's acceptance criterion is that there is exactly ONE table. It lives in
      * {@code conformance/config-defaults.json} and both SDKs are compared against it, key by key, so a
      * default that drifts in one language fails here rather than in a customer's cockpit (review
      * finding 8). The file is read from the repository root through the property the build wires up —

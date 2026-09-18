@@ -29,7 +29,7 @@ public record IngestResponse(int status, String body, Integer retryAfterSeconds,
     /** A proxy URL's Basic credentials: {@code http://user:secret@proxy:3128} (C15, X11). */
     private static final Pattern URL_USERINFO = Pattern.compile("(//)[^/@\\s]+:[^/@\\s]*@");
     /**
-     * C15's Prüfkriterium names two things to grep for: the proxy password <b>and its Base64 encoding</b>.
+     * C15's acceptance criterion names two things to grep for: the proxy password <b>and its Base64 encoding</b>.
      * Basic transmits the password merely Base64-encoded, so a bare {@code Basic dXNlcjpwdw==} in an
      * exception message — the shape a host's HTTP debugging decorator produces, which is the exact threat
      * {@link #failure(String)} exists for — IS the credential, not a hint of one. It needs its own

@@ -174,14 +174,23 @@ class EventFactoryTest {
                 .contains("src/test/java/");
     }
 
-    /** The root is discovered from user.dir's git root, not from whatever directory a job happens to run in. */
+    /**
+     * The root is discovered from user.dir's git root, not from whatever directory a job happens to run
+     * in.
+     *
+     * <p>The probe is {@code exists}, not {@code isDirectory}, because that is what production does and
+     * for the same reason: in a {@code git worktree} checkout {@code .git} is a FILE holding
+     * {@code gitdir: …}. A test that probes more narrowly than the code it checks is red exactly where
+     * the code is right — this assertion was {@code isDirectory} and failed in every worktree, with a
+     * message ("discovery fell back to user.dir") that was itself untrue.
+     */
     @Test
     void theProjectRootIsTheGitRootAboveTheWorkingDirectory() {
         String discovered = EventFactory.discoverProjectRoot();
 
         assertThat(discovered).isNotBlank();
-        assertThat(java.nio.file.Files.isDirectory(java.nio.file.Path.of(discovered, ".git")))
-                .describedAs("%s is not a git checkout; discovery fell back to user.dir", discovered)
+        assertThat(java.nio.file.Files.exists(java.nio.file.Path.of(discovered, ".git")))
+                .describedAs("%s holds no .git at all; discovery fell back to user.dir", discovered)
                 .isTrue();
     }
 

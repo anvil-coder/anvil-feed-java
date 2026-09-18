@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
  * Z4 budgets one millisecond for. Three small files answer the same question.
  *
  * <p><b>Call {@link #discover(Path)} ONCE, at startup, and hold the result.</b> It does up to twelve
- * {@code isDirectory} probes and three file reads; on the capture path, which Z4 budgets a millisecond
+ * pairs of filesystem probes and three file reads; on the capture path, which Z4 budgets a millisecond
  * for, that is filesystem I/O per event for an answer that cannot change while the process runs.
  *
  * <p>Immutable and safe to share across threads.
@@ -98,9 +98,57 @@ public final class GitContext {
             if (Files.isDirectory(candidate)) {
                 return candidate;
             }
+            Path linked = linkedGitDirectory(candidate);
+            if (linked != null) {
+                return linked;
+            }
             directory = directory.getParent();
         }
         return null;
+    }
+
+    /**
+     * A {@code .git} that is a FILE rather than a directory (review finding 11). {@code git worktree}
+     * checkouts and submodule deployments both have one, and it holds a single line:
+     *
+     * <pre>gitdir: /srv/app/.git/worktrees/release</pre>
+     *
+     * <p>Without this the release and the branch are simply absent on both — FR-6 b's "filled where
+     * determinable" quietly reading "filled where the layout is the common one", and the
+     * <b>deployment</b> layouts are exactly the two that take this branch.
+     *
+     * <p>Followed <b>once</b>, deliberately: git does not produce a gitdir pointing at another gitdir,
+     * and a chain is how a symlink loop gets into a path {@code Z4} budgets a millisecond for. The path
+     * may be relative, and is then relative to the directory holding the {@code .git} file.
+     *
+     * <p>Note what this does NOT do: in a worktree the loose refs and {@code config} live in the MAIN
+     * repository's git directory, not in this one, so {@code repo} and a branch's sha can still be null
+     * there. Nothing is guessed to cover that (FR-6 c) — a detached worktree, which is what a deployment
+     * checkout normally is, carries its sha in its own HEAD and is answered in full.
+     */
+    private static Path linkedGitDirectory(Path dotGit) {
+        try {
+            if (!Files.isRegularFile(dotGit)) {
+                return null;
+            }
+            String pointer = read(dotGit);
+            if (pointer == null) {
+                return null;
+            }
+            String firstLine = pointer.split("\n", 2)[0].trim();
+            if (!firstLine.startsWith("gitdir:")) {
+                return null;
+            }
+            String target = firstLine.substring("gitdir:".length()).trim();
+            if (target.isEmpty()) {
+                return null;
+            }
+            Path parent = dotGit.getParent();
+            Path resolved = (parent == null ? Path.of(target) : parent.resolve(target)).normalize();
+            return Files.isDirectory(resolved) ? resolved : null;
+        } catch (RuntimeException unusable) {
+            return null;
+        }
     }
 
     /** A packed-refs checkout has no loose ref file for the branch. */

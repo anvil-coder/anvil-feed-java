@@ -166,4 +166,31 @@ class AnvilFeedEnvironmentTest {
                     assertThat(config.enabled()).isTrue();
                 });
     }
+
+    // ---------------------------------------------------------------- the two names spelled out here
+
+    /*
+     * Review finding 14. The loop above reads its five names OUT of config-defaults.json, which is what
+     * makes it notice a sixth — and is also why it cannot notice a rename: a variable renamed in the
+     * starter AND in the contract file keeps that loop green, and the Helm chart that types the old name
+     * breaks with the whole build green. Two of the five are only ever asserted by that loop
+     * (`grep ANVIL_INGEST_ENDPOINT java/anvil-feed-spring-boot-starter/src/test` found nothing), so they
+     * are spelled out HERE, as literals, where a rename has to be made twice on purpose.
+     */
+
+    @Test
+    void theEndpointVariableIsSpelledAnvilIngestEndpoint() {
+        runner(Map.of("ANVIL_INGEST_TOKEN", TOKEN, "ANVIL_SERVICE", "shop-api",
+                "ANVIL_INGEST_ENDPOINT", "https://ingest.example/api/feed"))
+                .run(context -> assertEquals("https://ingest.example/api/feed",
+                        context.getBean(AnvilFeedConfig.class).endpoint()));
+    }
+
+    @Test
+    void theReleaseVariableIsSpelledAnvilRelease() {
+        runner(Map.of("ANVIL_INGEST_TOKEN", TOKEN, "ANVIL_SERVICE", "shop-api",
+                "ANVIL_RELEASE", "1.4.2"))
+                .run(context -> assertEquals("1.4.2",
+                        context.getBean(AnvilFeedConfig.class).release()));
+    }
 }

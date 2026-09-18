@@ -104,4 +104,73 @@ class GitContextTest {
 
         assertThat(GitContext.discover(root).release()).isNull();
     }
+
+    // ------------------------------------------------------------------ a .git FILE (finding 11)
+
+    /**
+     * The layout {@code git worktree add --detach} leaves behind, built by hand for the reason the rest
+     * of this file is built by hand: no subprocess, no git binary, no repository identity to configure.
+     * The checkout's {@code .git} is a FILE holding {@code gitdir: …}; the git directory it points at is
+     * a per-worktree one under the main repository, and it carries that worktree's own HEAD.
+     *
+     * @param gitdirLine what the .git file says, so a relative pointer can be tested with the same helper
+     */
+    private static Path worktree(Path root, String head, String gitdirLine) throws IOException {
+        Path main = Files.createDirectories(root.resolve("main/.git"));
+        Path perWorktree = Files.createDirectories(main.resolve("worktrees/release"));
+        Files.writeString(perWorktree.resolve("HEAD"), head + "\n");
+        Files.writeString(perWorktree.resolve("config"),
+                "[remote \"origin\"]\n\turl = https://forge.example/shop/api.git\n");
+        Path checkout = Files.createDirectories(root.resolve("release"));
+        Files.writeString(checkout.resolve(".git"),
+                "gitdir: " + (gitdirLine == null ? perWorktree.toString() : gitdirLine) + "\n");
+        return checkout;
+    }
+
+    /**
+     * A deployment checkout made with {@code git worktree} has no {@code .git} DIRECTORY anywhere above
+     * it, so before this every such deployment reported no release and no branch at all — FR-6 b's
+     * "filled where determinable" silently reading "where the layout is the common one".
+     */
+    @Test
+    void aGitFilePointingAtAWorktreeGitDirectoryIsFollowed(@TempDir Path root) throws IOException {
+        Path checkout = worktree(root, SHA, null);
+
+        GitContext context = GitContext.discover(Files.createDirectories(checkout.resolve("src/main")));
+
+        assertThat(context.release()).isEqualTo(SHA);
+        assertThat(context.repo()).isEqualTo("shop/api");
+    }
+
+    /** A submodule's {@code .git} file is written relative to the checkout, so the pointer must be too. */
+    @Test
+    void aRelativeGitdirPointerIsResolvedAgainstTheCheckout(@TempDir Path root) throws IOException {
+        Path checkout = worktree(root, "ref: refs/heads/main", "../main/.git/worktrees/release");
+
+        assertThat(GitContext.discover(checkout).branch()).isEqualTo("main");
+    }
+
+    /**
+     * Followed ONCE: a gitdir that names another {@code .git} FILE is not a shape git produces, and a
+     * chain is how a loop gets into a path Z4 budgets a millisecond for.
+     *
+     * <p>Asserted against a SENTINEL rather than against null, and hermetically for the reason
+     * {@link #nothingIsInventedWhereThereIsNothingToRead} gives: where nothing is found the walk
+     * continues upwards, and on a CI image whose {@code java.io.tmpdir} lives under the workspace that
+     * finds the real checkout. What must be true either way is that the second hop's sha is never the
+     * answer.
+     */
+    @Test
+    void aGitdirPointerIsNotChased(@TempDir Path root) throws IOException {
+        String secondHop = "c".repeat(40);
+        Path far = Files.createDirectories(root.resolve("far"));
+        Files.writeString(far.resolve("HEAD"), secondHop + "\n");
+        Path hop = Files.createDirectories(root.resolve("hop"));
+        Files.writeString(hop.resolve(".git"), "gitdir: " + far + "\n");
+        Files.writeString(root.resolve(".git"), "gitdir: " + hop.resolve(".git") + "\n");
+
+        assertThat(GitContext.discover(root).release())
+                .describedAs("one hop, not a chain")
+                .isNotEqualTo(secondHop);
+    }
 }
