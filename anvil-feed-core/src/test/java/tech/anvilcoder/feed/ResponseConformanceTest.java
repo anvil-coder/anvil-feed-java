@@ -18,9 +18,10 @@ import static org.assertj.core.api.Assertions.fail;
 
 /**
  * {@code conformance/README.md}: "Feed the {@code body} of the matching entry in
- * {@code responses/index.json} to the SDK's response parser and assert the resulting decision (drop,
- * retry, pause, stop) against that entry's {@code status} and {@code retry_after} — the actual HTTP
- * status and header the SDK's retry rule keys on, not the file name."
+ * {@code responses/index.json} to the SDK's response parser and assert the resulting decision — the
+ * entry's own {@code retry} verdict: {@code none} (drop or clear), {@code after-delay},
+ * {@code whole-batch}, {@code backoff} — against that entry's {@code status} and {@code retry_after} —
+ * the actual HTTP status and header the SDK's retry rule keys on, not the file name."
  *
  * <p>This is that gate, and it is driven by the index rather than by a transcription of it: a response
  * the server learns to give is added in one place and this suite starts exercising it. Every case goes
