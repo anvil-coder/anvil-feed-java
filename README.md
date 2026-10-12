@@ -1,5 +1,13 @@
 # The Java SDKs
 
+> **Read-only mirror.** This repository is the `java/` directory of the private `anvil-coder/anvil-feed`
+> monorepo, split on every tag and every push to `main`. Nothing is edited here: a push to this
+> repository is overwritten by the next mirror run. Issues and pull requests go to the monorepo's owners.
+> `./gradlew build` compiles from this checkout; the tests that read the monorepo's `conformance/`
+> fixtures (`-Danvilfeed.conformance=…`) fail here by design, and CI runs in the monorepo. Maven Central
+> coordinates `tech.anvil-coder:anvil-feed-core` and `tech.anvil-coder:anvil-feed-spring-boot-starter`
+> are not published yet.
+
 Two modules, one Gradle build, one version number.
 
 | Module | What it is | Depends on |
@@ -12,7 +20,7 @@ is the JDK's own `java.net.http.HttpClient` (O11), so the JVM's proxy settings a
 without any configuration of ours (C11, C12). slf4j is `compileOnly`: the SDK logs through whatever
 the host already has, and pulls in nothing to do it.
 
-**The fifteen-minute guide is [`docs/integrate-spring-boot.md`](../docs/integrate-spring-boot.md).**
+**The fifteen-minute guide is [`docs/integrate-spring-boot.md`](https://github.com/anvil-coder/anvil-feed/blob/main/docs/integrate-spring-boot.md)** — in the monorepo, a private repository; ask the owners for access.
 Start there. This page is about the build.
 
 ## Using the core on its own
