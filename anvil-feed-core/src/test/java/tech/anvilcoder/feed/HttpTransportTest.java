@@ -41,7 +41,7 @@ class HttpTransportTest {
             assertThat(received.body()).isEqualTo(BODY);
             assertThat(received.header("authorization")).isEqualTo("Bearer " + TOKEN);
             assertThat(received.header("content-type")).isEqualTo("application/json");
-            assertThat(received.header("user-agent")).isEqualTo("anvil-feed-java/0.1.0");
+            assertThat(received.header("user-agent")).isEqualTo("anvil-feed-java/0.1.1");
             assertThat(received.header("origin"))
                     .describedAs("a server token presented with an Origin is refused 403 and has to be "
                             + "rotated; this SDK sets none, ever")
