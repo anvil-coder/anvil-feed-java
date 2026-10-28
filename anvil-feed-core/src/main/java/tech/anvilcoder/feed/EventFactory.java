@@ -85,6 +85,7 @@ public final class EventFactory {
     private final AnvilFeedConfig config;
     private final Scrubber scrubber;
     private final GitContext git;
+    private final Release release;
     private final SourceContext sources;
     private final String sdkName;
     private final String sdkVersion;
@@ -92,6 +93,14 @@ public final class EventFactory {
 
     public EventFactory(AnvilFeedConfig config, Scrubber scrubber, GitContext git) {
         this(config, scrubber, git, SDK_NAME, SDK_VERSION, "java");
+    }
+
+    /**
+     * With the release the caller resolved through the whole chain ({@link Release#discover}, issue #13);
+     * the other constructors carry what config and git already know, without touching the filesystem.
+     */
+    public EventFactory(AnvilFeedConfig config, Scrubber scrubber, GitContext git, Release release) {
+        this(config, scrubber, git, SDK_NAME, SDK_VERSION, "java", release);
     }
 
     public EventFactory(AnvilFeedConfig config, Scrubber scrubber, GitContext git,
@@ -107,15 +116,26 @@ public final class EventFactory {
      */
     public EventFactory(AnvilFeedConfig config, Scrubber scrubber, GitContext git,
                         String sdkName, String sdkVersion, String language) {
+        this(config, scrubber, git, sdkName, sdkVersion, language, null);
+    }
+
+    private EventFactory(AnvilFeedConfig config, Scrubber scrubber, GitContext git,
+                         String sdkName, String sdkVersion, String language, Release release) {
         this.config = Objects.requireNonNull(config, "config");
         this.scrubber = Objects.requireNonNull(scrubber, "scrubber");
         this.git = Objects.requireNonNull(git, "git");
+        this.release = release == null ? Release.known(config.release(), git) : release;
         this.sdkName = Objects.requireNonNull(sdkName, "sdkName");
         this.sdkVersion = Objects.requireNonNull(sdkVersion, "sdkVersion");
         this.language = Objects.requireNonNull(language, "language");
         // Once, at construction. Doing it per event would put a directory probe on the capture path.
         this.sources = SourceContext.discover(config.contextLines(), config.maxContextLineChars(),
                 config.projectRoot() == null ? discoverProjectRoot() : config.projectRoot());
+    }
+
+    /** The release every event of this factory carries, and which source it came from. */
+    public Release release() {
+        return release;
     }
 
     public FeedEvent fromThrowable(Throwable error) {
@@ -272,9 +292,8 @@ public final class EventFactory {
         payload.put("sdk", sdk);
         payload.put("exception", exception);
 
-        String release = config.release() != null ? config.release() : git.release();
-        if (release != null) {
-            payload.put("release", release);
+        if (release.value() != null) {
+            payload.put("release", release.value());
         }
         if (context.get("request") instanceof Map<?, ?> request && !request.isEmpty()) {
             // The URL goes in as it came. It is scrubbed (userinfo and parameters) by Scrubber.scrubUrl

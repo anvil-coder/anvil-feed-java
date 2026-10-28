@@ -9,6 +9,7 @@ import org.springframework.boot.ExitCodeGenerator;
 import tech.anvilcoder.feed.AnvilFeedClient;
 import tech.anvilcoder.feed.AnvilFeedConfig;
 import tech.anvilcoder.feed.IngestResponse;
+import tech.anvilcoder.feed.Release;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -100,8 +101,13 @@ public final class AnvilFeedTestEvent implements CommandLineRunner, ExitCodeGene
         lines.add("endpoint:    " + config.eventsUrl());
         lines.add("service:     " + config.service());
         lines.add("environment: " + config.environment());
-        lines.add("release:     " + (config.release() == null
-                ? "(none — not a git checkout, and ANVIL_RELEASE is unset)" : config.release()));
+        // The source beside the value (issue #13): "(none)" alone sent an operator to guess which of the
+        // five places the SDK had looked in.
+        Release release = client.release();
+        lines.add("release:     " + (release.value() == null
+                ? "(none — ANVIL_RELEASE is unset, no .git, no REVISION or .release file in "
+                        + System.getProperty("user.dir", ".") + ", and it is not a releases/<id> directory)"
+                : release.value() + " (" + release.source() + ")"));
         lines.add("token:       " + (config.token() == null
                 ? "MISSING — set ANVIL_INGEST_TOKEN"
                 : config.token().substring(0, Math.min(TOKEN_PREVIEW_CHARS, config.token().length()))

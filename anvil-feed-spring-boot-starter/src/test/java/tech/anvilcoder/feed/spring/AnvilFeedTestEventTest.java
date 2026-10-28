@@ -41,6 +41,17 @@ class AnvilFeedTestEventTest {
                 .build(FeedLogger.toSystemLogger());
     }
 
+    /** Issue #13: the release line names its source, so a missing release says where the SDK looked. */
+    @Test
+    void theReleaseLineNamesTheSourceThatAnswered() {
+        AnvilFeedConfig configured = AnvilFeedConfig.builder().token(TOKEN).service("shop-api")
+                .release(" 1.4.2 ").build(FeedLogger.toSystemLogger());
+
+        assertThat(run(configured, new StubIngest()).lines()).contains("release:     1.4.2 (ANVIL_RELEASE)");
+        assertThat(run(config(), new StubIngest()).lines())
+                .anyMatch(line -> line.startsWith("release:     (none — ANVIL_RELEASE is unset, no .git, "));
+    }
+
     @Test
     void acceptedNamesTheEventAndWhereToFindIt() {
         Run run = run(config(), new StubIngest());

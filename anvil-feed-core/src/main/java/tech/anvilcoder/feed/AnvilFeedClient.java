@@ -155,8 +155,12 @@ public final class AnvilFeedClient implements AutoCloseable {
         // flush, on whichever thread the flush runs on, and the capture path below reads it.
         LoopGuard guard = new LoopGuard(config.ignoredRequestPaths());
 
+        // Issue #13: past .git, a REVISION/.release file and the releases/<id> directory of a zero-downtime
+        // deploy answer, both read from the working directory the git discovery above also starts from.
+        Release release = Release.discover(config.release(), context, Path.of(System.getProperty("user.dir", ".")));
+
         return new AnvilFeedClient(config,
-                new EventFactory(config, new Scrubber(config.denylist()), context),
+                new EventFactory(config, new Scrubber(config.denylist()), context, release),
                 events,
                 new Sender(config, events, wire, log, clock, guard),
                 new RateGate(config.fingerprintCap(), config.fingerprintWindowMs(), clock),
@@ -379,6 +383,11 @@ public final class AnvilFeedClient implements AutoCloseable {
 
     public Sender sender() {
         return sender;
+    }
+
+    /** The release every event carries and the source it came from (issue #13), for the self-test. */
+    public Release release() {
+        return factory.release();
     }
 
     public AnvilFeedConfig config() {
